@@ -5,16 +5,20 @@ import torch
 import pickle as pkl
 import argparse
 import yaml
+import copy
 
 from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
 from torch_geometric.datasets import Planetoid
+import torch_geometric.utils
 
 import matplotlib.pyplot as plt
 
 from GNN import GNN
 from Trainer import train, test
 from Kernel import KernelRegression
+
+# import os
+# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -28,7 +32,51 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+def sample_subgraph(data: Data, sample_size: int) -> Data:
+    
+    assert isinstance(data.x, torch.Tensor)
+    assert isinstance(data.y, torch.Tensor)
+    assert isinstance(data.edge_index, torch.Tensor)
+    num_classes = data.y.max().item() + 1
+    assert isinstance(num_classes, int)
+    
+    while True:
+        sampled_nodes = torch.randperm(sample_size)[:sample_size].to(DEVICE)
+        subgraph_data = torch_geometric.utils.k_hop_subgraph(
+            sampled_nodes, 1, data.edge_index, relabel_nodes=True
+        )
+        node_ind, edge_ind, mapping, edge_mask = subgraph_data
+        
+        sampled_data = Data(
+            x = data.x[node_ind],
+            edge_index = edge_ind,
+            y = data.y[node_ind],
+            train_mask = data.train_mask[node_ind],
+            val_mask = data.val_mask[node_ind],
+            test_mask = data.test_mask[node_ind],
+        ).to(DEVICE)
+        
+        assert isinstance(sampled_data.y, torch.Tensor)
+        if all((sampled_data.y[sampled_data.train_mask] == cls).sum() > 0 for cls in range(num_classes)):
+            return sampled_data
 
+def get_features(data: Data, mask: torch.Tensor, model: GNN, best_model: GNN) -> tuple[list[torch.Tensor], torch.Tensor]:
+    
+    features = []
+    good_nodes = len(mask[mask == True])
+    
+    assert isinstance(data.y, torch.Tensor)
+    y_test = data.y.detach()[mask]
+    y_test = torch.reshape(y_test, (1, good_nodes, -1))
+    
+    features = model(data, return_intermediate=True)
+    preds = best_model(data)[mask]
+    preds = torch.reshape(preds, (1, good_nodes, -1)).detach()
+    
+    for i in range(len(features)):
+        features[i] = torch.reshape(features[i][mask], (1, good_nodes, -1)).detach()
+    
+    return features, preds
 
 def main():
     
@@ -42,36 +90,33 @@ def main():
     
     dataset = Planetoid(root=f'/tmp/{args.dataset}', name=args.dataset, split='full').to(DEVICE)
     
+    all_data = dataset[0]
+    assert isinstance(all_data, Data)
+    all_data = all_data.to(DEVICE)
+    
     train_subgraph_size: list[int] = CONSTANTS['train_sample_sizes'][args.dataset]
     
     feature_limit: int = CONSTANTS['feature_limit'][args.dataset]    
     if feature_limit == -1: 
         feature_limit = dataset.num_features
     
-    assert isinstance(dataset._data, Data)
     num_classes: int = dataset.num_classes
     num_features: int = dataset.num_features
     
-    assert isinstance(dataset._data.num_nodes, int)
-    num_nodes = dataset._data.num_nodes
+    assert isinstance(all_data.num_nodes, int)
+    num_nodes = all_data.num_nodes
     
-    assert isinstance(dataset._data.edge_index, torch.Tensor)
-    edge_list = dataset._data.edge_index.clone().to(DEVICE)
+    assert isinstance(all_data.edge_index, torch.Tensor)
+    edge_list = all_data.edge_index.clone().to(DEVICE)
     
     assert edge_list.ndim == 2 and edge_list.shape[0] == 2
-    assert edge_list.shape[1] == dataset._data.num_edges
+    assert edge_list.shape[1] == all_data.num_edges
 
     num_edges: int = edge_list.shape[1]
     edge_weights: torch.Tensor = torch.full((num_edges,), 1.0 / num_nodes, device=DEVICE)
-    all_adjacency_matrix: torch.Tensor = torch.sparse_coo_tensor(edge_list, edge_weights, (num_nodes, num_nodes), device=DEVICE).to_dense()
-    
-    assert isinstance(dataset._data.x, torch.Tensor)
-    assert isinstance(dataset._data.y, torch.Tensor)
-    all_test_data = dataset._data.subgraph(dataset._data.test_mask)
-    # all_test_data.x = all_test_data.x[:, :feature_limit]
-    loader_all_test = DataLoader([all_test_data], batch_size=1, shuffle=False)
-    
-    GNN_architectures = CONSTANTS['GNN_architecture'][args.dataset]
+    all_adjoint_matrix: torch.Tensor = torch.sparse_coo_tensor(edge_list, edge_weights, (num_nodes, num_nodes), device=DEVICE).to_dense()
+        
+    GNN_architectures: list[list[list[int]]] = CONSTANTS['GNN_architecture'][args.dataset]
     num_models = len(GNN_architectures)
     
     for i in range(num_models):
@@ -91,31 +136,17 @@ def main():
         
         for sample_ind, sample_size in enumerate(train_subgraph_size):
             
-            while True:
-                sampled_data = dataset._data.subgraph(torch.randint(0, dataset._data.num_nodes, (sample_size,)).to(DEVICE))
-                
-                assert isinstance(sampled_data.y, torch.Tensor)
-                if all((sampled_data.y[sampled_data.train_mask] == cls).sum() > 0 for cls in range(num_classes)):
-                    break
+            sampled_data = sample_subgraph(all_data, sample_size)
             
-            assert isinstance(sampled_data.x, torch.Tensor)
-            # sampled_data.x = sampled_data.x[:, :feature_limit]
-                
+            num_subgraph_nodes = sampled_data.num_nodes
+            assert isinstance(num_subgraph_nodes, int)
+            print(sample_size, num_subgraph_nodes)
             assert isinstance(sampled_data.edge_index, torch.Tensor)
             edge_list = sampled_data.edge_index.clone()
             
             num_edges = edge_list.shape[1]
-            edge_weights = torch.full((num_edges,), 1.0 / sample_size, device=DEVICE)
-            adjacency_matrix = torch.sparse_coo_tensor(edge_list, edge_weights, (sample_size, sample_size)).to_dense()
-            
-            train_data = sampled_data.subgraph(sampled_data.train_mask)
-            # train_data.x = train_data.x[:, :feature_limit]
-            
-            val_data = sampled_data.subgraph(sampled_data.val_mask)
-            # val_data.x = val_data.x[:, :feature_limit]
-            
-            test_data = sampled_data.subgraph(sampled_data.test_mask)
-            # test_data.x = test_data.x[:, :feature_limit]
+            edge_weights = torch.full((num_edges,), 1.0 / num_subgraph_nodes, device=DEVICE)
+            adjoint_matrix = torch.sparse_coo_tensor(edge_list, edge_weights, (num_subgraph_nodes, num_subgraph_nodes)).to_dense()
             
             models = [GNN(f"gnn{cnt}", 'GNN', arch, False, device=DEVICE) for cnt, arch in enumerate(GNN_architectures)]
             
@@ -123,22 +154,56 @@ def main():
             
             for model_ind, model in enumerate(models):
                 
-                loader_train = DataLoader([train_data], batch_size=train_args['batch_size'], shuffle=True)
-                loader_val = DataLoader([val_data], batch_size=1, shuffle=False)
+                original_model = copy.deepcopy(model)
+                
                 
                 val_losses, losses, best_model, best_loss = train(
-                    loader_train, loader_val, model, loss_fn, train_args, logistic=True
+                    sampled_data, sampled_data.train_mask, sampled_data.val_mask, model, loss_fn, train_args, logistic=True
                 )
                 
-                loader_test = DataLoader([test_data], batch_size=1, shuffle=False)
-                test_loss = test(loader_test, best_model, logistic=True)
-                transf_test_loss = test(loader_all_test, best_model, logistic=True)
+                test_loss = test(sampled_data, sampled_data.test_mask, best_model, logistic=True)
+                transf_test_loss = test(all_data, all_data.test_mask, best_model, logistic=True)
 
                 gnn_results[rlz, sample_ind, model_ind] = test_loss
                 gnn_transf_results[rlz, sample_ind, model_ind] = transf_test_loss
-    
+                                
+                feats_train, _                  = get_features(sampled_data, sampled_data.train_mask, original_model, best_model)
+                feats_test, test_preds          = get_features(sampled_data, sampled_data.test_mask, original_model, best_model)
+                feats_all_test, all_test_preds  = get_features(all_data, all_data.test_mask, original_model, best_model)
+                    
+                consF = model.feature_list[:-1] + model.mlp_list
+                consK = model.K_list + [1] * model.num_mlp_layers
+                
+                kernel = KernelRegression(
+                    len(consF) - 1, consK, consF, adjoint_matrix, logistic=True
+                )
+                
+                weight_list = original_model.get_weights()
+                
+                # assert isinstance(train_data.y, torch.Tensor)
+                # kernel_preds = kernel.predict(
+                #     feats_train, weight_list, train_data.y, feats_test
+                # )
+                
+                # eig_val = kernel.get_eigenvalues() / num_subgraph_nodes
+                
+                # assert isinstance(test_data.y, torch.Tensor)
+                # test_loss = torch.nn.functional.cross_entropy(kernel_preds[0], test_data.y[0. :, 0])
+                
+                # kernel_transf_preds = kernel.predict(
+                #     feats_train, weight_list, train_data.y, feats_all_test, all_adjoint_matrix
+                # )
+                
+                # assert isinstance(all_data.y, torch.Tensor)
+                # all_test_loss = torch.nn.functional.cross_entropy(kernel_transf_preds[0], all_data.y[0. :, 0])
+                
+                # kernel_results[rlz, sample_ind, model_ind] = test_loss
+                # kernel_transf_results[rlz, sample_ind, model_ind] = all_test_loss
+
     print('GNN results:', gnn_results)
     print('GNN transf results:', gnn_transf_results)
+    print('Kernel results:', kernel_results)
+    print('Kernel transf results:', kernel_transf_results)
                 
 if __name__ == '__main__':
     main()

@@ -1,6 +1,5 @@
 import torch
 from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
 from GNN import GNN
 
 import copy
@@ -32,8 +31,9 @@ def get_optimizer(args: dict, params: Iterator[torch.nn.Parameter]) -> tuple[tor
     return optimizer, scheduler
 
 def train(
-    loader_train: DataLoader, 
-    loader_val: DataLoader, 
+    data: Data,
+    train_mask: torch.Tensor,
+    val_mask: torch.Tensor,
     model: GNN, 
     loss_fn, 
     args: dict, 
@@ -48,27 +48,22 @@ def train(
     
     for epoch in trange(args['epochs'], desc="Training", unit="Epochs"):
         
-        total_loss = 0.0
         model.train()
+            
+        optimizer.zero_grad()
         
-        for batch in loader_train:
-            
-            optimizer.zero_grad()
-            
-            pred = model(batch)
-            label = batch.y
-            
-            loss = loss_fn(pred, label)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item() * batch.num_graphs 
+        pred = model(data)
         
-        losses.append(total_loss)
+        assert isinstance(data.y, torch.Tensor)
+        loss = loss_fn(pred[train_mask], data.y[train_mask])
+        loss.backward()
+        optimizer.step()
         
-        if epoch % 10 == 0:
+        losses.append(loss.item())
+        
+        if (epoch + 1) % 10 == 0:
             
-            val_loss = test(loader_val, model, logistic=logistic)
+            val_loss = test(data, val_mask, model, logistic=logistic)
             val_losses.append(val_loss)
             
             if val_loss < best_loss:
@@ -82,28 +77,22 @@ def train(
 
 
 def test(
-    loader_test: DataLoader,
+    data: Data,
+    test_mask: torch.Tensor,
     model: GNN,
     logistic: bool
 ) -> float:
     
     model.eval()
-    total_loss = torch.tensor(0.0)
-    num_data = 0
-    for data in loader_test:
-        data: Data
-        with torch.no_grad():
-            pred = model(data)
-            label = data.y
-        
-        assert isinstance(label, torch.Tensor)
-        
-        if logistic:
-            total_loss += torch.nn.functional.cross_entropy(pred, label).cpu()
-        else:
-            total_loss += torch.nn.functional.mse_loss(pred.view(-1, 1), label.view(-1, 1), reduction='sum').cpu()
-        
-        num_data += data.num_graphs
     
-    return total_loss.item() / num_data if num_data > 0 else 0.0
+    with torch.no_grad():
+        pred = model(data)
+        label = data.y
+    
+    assert isinstance(label, torch.Tensor)
+    
+    if logistic:
+        return torch.nn.functional.cross_entropy(pred[test_mask], label[test_mask]).cpu().item()
+    else:
+        return torch.nn.functional.mse_loss(pred.view(-1, 1), label.view(-1, 1), reduction='sum').cpu().item()
     

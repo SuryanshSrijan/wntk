@@ -59,15 +59,15 @@ class GNN(torch.nn.Module):
         
         self.feature_list = architecture[0]
         self.mlp_list = architecture[1]
-        self.K_list = architecture[2] if len(architecture) > 2 else None
+        self.K_list = architecture[2]
         self.softmax = softmax
         self.device = device
         
         self.num_layers = len(self.feature_list) - 1
         self.num_mlp_layers = len(self.mlp_list) - 1
         
-        if self.K_list is not None: 
-            assert self.num_layers == len(self.K_list), "Mismatch between number of layers and K_list length"
+        # if self.K_list is not None: 
+        assert self.num_layers == len(self.K_list), "Mismatch between number of layers and K_list length"
         
         self.layers = torch.nn.ModuleList()
         self.mlp_layers = torch.nn.ModuleList()
@@ -85,20 +85,51 @@ class GNN(torch.nn.Module):
             self.mlp_layers.append(torch.nn.Linear(self.mlp_list[i], self.mlp_list[i+1], bias=False, device=self.device))
             # torch.nn.init.xavier_uniform_(self.mlp_layers[i].weight, gain=1.0)
     
-    def forward(self, data: Data):
+    def forward(self, data: Data, return_intermediate: bool = False):
         
         x, edge_index, edge_weight, batch = data.x, data.edge_index, data.edge_weight, data.batch
         assert isinstance(x, torch.Tensor)
         
+        intermediate_outputs = [x]
+        
         for i in range(self.num_layers):
             x = self.layers[i](x, edge_index=edge_index, edge_weight=edge_weight)
             x = torch.nn.functional.relu(x)
+            
+            if return_intermediate:
+                intermediate_outputs.append(x)
         
         for i in range(self.num_mlp_layers):
             x = self.mlp_layers[i](x) / torch.sqrt(torch.tensor(self.mlp_list[i]))
             x = torch.nn.functional.relu(x)
+            
+            if return_intermediate:
+                intermediate_outputs.append(x)
         
         if self.softmax:
             x = torch.nn.functional.log_softmax(x, dim=1)
         
+        if return_intermediate:
+            return intermediate_outputs
+        
         return x
+    
+    def get_weights(self):
+        
+        weight_list = []
+        
+        fweights = torch.empty([self.feature_list[1], self.feature_list[0], self.K_list[0]], device=self.device)
+        
+        for i, layer in enumerate(self.layers):
+            if self.gnn_type == 'GNN':
+                fweights[::i] = layer.weight
+        
+        weight_list.append(fweights)
+        
+        mlp_weights = torch.empty([self.mlp_list[1], self.mlp_list[0], self.num_mlp_layers], device=self.device)
+        
+        for i, layer in enumerate(self.mlp_layers):
+            mlp_weights[::i] = layer.weight
+        
+        weight_list.append(mlp_weights)
+        return weight_list
