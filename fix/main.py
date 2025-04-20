@@ -32,6 +32,27 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+def create_balanced_masks(y: torch.Tensor, num_classes: int, sample_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    
+    train_mask = torch.zeros_like(y, dtype=torch.bool)
+    val_mask = torch.zeros_like(y, dtype=torch.bool)
+    test_mask = torch.zeros_like(y, dtype=torch.bool)
+    
+    for cls in range(num_classes):
+        cls_indices = (y == cls).nonzero(as_tuple=True)[0]
+        num_cls = cls_indices.numel()
+        
+        num_train = num_cls // 2
+        num_val = num_cls // 4
+        num_test = num_cls - num_train - num_val
+        
+        selected_indices = cls_indices[torch.randperm(num_cls)]
+        train_mask[selected_indices[:num_train]] = True
+        val_mask[selected_indices[num_train:num_train + num_val]] = True
+        test_mask[selected_indices[num_train + num_val:num_train + num_val + num_test]] = True
+    
+    return train_mask, val_mask, test_mask
+
 def sample_subgraph(data: Data, sample_size: int) -> Data:
     
     assert isinstance(data.x, torch.Tensor)
@@ -39,21 +60,41 @@ def sample_subgraph(data: Data, sample_size: int) -> Data:
     assert isinstance(data.edge_index, torch.Tensor)
     num_classes = data.y.max().item() + 1
     assert isinstance(num_classes, int)
+    assert isinstance(data.num_nodes, int)
     
     while True:
-        sampled_nodes = torch.randperm(sample_size)[:sample_size].to(DEVICE)
-        subgraph_data = torch_geometric.utils.k_hop_subgraph(
-            sampled_nodes, 1, data.edge_index, relabel_nodes=True
+
+        seed = torch.randint(0, data.num_nodes, (1,), device=DEVICE)
+        node_idx, edge_index, _, _ = torch_geometric.utils.k_hop_subgraph(
+            seed.tolist(), num_hops=sample_size, edge_index=data.edge_index,
+            relabel_nodes=True
         )
-        node_ind, edge_ind, mapping, edge_mask = subgraph_data
+
+        if node_idx.size(0) < sample_size:
+            continue
+
+        selected = node_idx[:sample_size] 
+        selected_mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=DEVICE)
+        selected_mask[selected] = True
+        
+        edge_mask = selected_mask[data.edge_index[0]] & selected_mask[data.edge_index[1]]
+        edge_index = data.edge_index[:, edge_mask]
+
+        relabeled_edge_index, relabeled_mapping = torch_geometric.utils.subgraph(
+            selected_mask, data.edge_index, relabel_nodes=True
+        )
+        
+        train_mask, val_mask, test_mask = create_balanced_masks(
+            data.y[selected], num_classes, sample_size
+        )
         
         sampled_data = Data(
-            x = data.x[node_ind],
-            edge_index = edge_ind,
-            y = data.y[node_ind],
-            train_mask = data.train_mask[node_ind],
-            val_mask = data.val_mask[node_ind],
-            test_mask = data.test_mask[node_ind],
+            x = data.x[selected],
+            edge_index = relabeled_edge_index,
+            y = data.y[selected],
+            train_mask = train_mask,
+            val_mask = val_mask,
+            test_mask = test_mask,
         ).to(DEVICE)
         
         assert isinstance(sampled_data.y, torch.Tensor)
@@ -180,25 +221,27 @@ def main():
                 
                 weight_list = original_model.get_weights()
                 
-                # assert isinstance(train_data.y, torch.Tensor)
-                # kernel_preds = kernel.predict(
-                #     feats_train, weight_list, train_data.y, feats_test
-                # )
+                breakpoint()
                 
-                # eig_val = kernel.get_eigenvalues() / num_subgraph_nodes
+                assert isinstance(sampled_data.y, torch.Tensor)
+                kernel_preds = kernel.predict(
+                    feats_train, weight_list, sampled_data.y[sampled_data.train_mask], feats_test
+                )
+                
+                eig_val = kernel.get_eigenvalues() / num_subgraph_nodes
                 
                 # assert isinstance(test_data.y, torch.Tensor)
-                # test_loss = torch.nn.functional.cross_entropy(kernel_preds[0], test_data.y[0. :, 0])
+                test_loss = torch.nn.functional.cross_entropy(kernel_preds[0], sampled_data.y[sampled_data.test_mask][:, 0])
                 
-                # kernel_transf_preds = kernel.predict(
-                #     feats_train, weight_list, train_data.y, feats_all_test, all_adjoint_matrix
-                # )
+                kernel_transf_preds = kernel.predict(
+                    feats_train, weight_list, sampled_data.y[sampled_data.train_mask], feats_all_test, all_adjoint_matrix
+                )
                 
-                # assert isinstance(all_data.y, torch.Tensor)
-                # all_test_loss = torch.nn.functional.cross_entropy(kernel_transf_preds[0], all_data.y[0. :, 0])
+                assert isinstance(all_data.y, torch.Tensor)
+                all_test_loss = torch.nn.functional.cross_entropy(kernel_transf_preds[0], all_data.y[:, 0])
                 
-                # kernel_results[rlz, sample_ind, model_ind] = test_loss
-                # kernel_transf_results[rlz, sample_ind, model_ind] = all_test_loss
+                kernel_results[rlz, sample_ind, model_ind] = test_loss
+                kernel_transf_results[rlz, sample_ind, model_ind] = all_test_loss
 
     print('GNN results:', gnn_results)
     print('GNN transf results:', gnn_transf_results)

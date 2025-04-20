@@ -118,18 +118,18 @@ class GNN(torch.nn.Module):
         
         weight_list = []
         
-        fweights = torch.empty([self.feature_list[1], self.feature_list[0], self.K_list[0]], device=self.device)
+        fweights = torch.empty([self.feature_list[0], self.feature_list[1], self.K_list[0]], device=self.device)
         
-        for i, layer in enumerate(self.layers):
+        for i in range(self.num_layers):
             if self.gnn_type == 'GNN':
-                fweights[::i] = layer.weight
+                fweights[:, :, i] = self.layers[0].weight[i].clone()
         
         weight_list.append(fweights)
         
-        mlp_weights = torch.empty([self.mlp_list[1], self.mlp_list[0], self.num_mlp_layers], device=self.device)
+        mlp_weights = torch.empty([self.mlp_list[0], self.mlp_list[1], self.num_mlp_layers], device=self.device)
         
-        for i, layer in enumerate(self.mlp_layers):
-            mlp_weights[::i] = layer.weight
+        for i in range(self.num_mlp_layers):
+            mlp_weights[:, :, i] = torch.transpose(self.mlp_layers[i].weight, 0, 1)
         
         weight_list.append(mlp_weights)
         return weight_list
