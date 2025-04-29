@@ -22,7 +22,7 @@ def createGraph(n, l=50, distMax=15, ratio=0.1):
     #D = np.power(np.sum(S,axis=1),-0.5)
     #S = D*S
     #S = np.transpose(D)*S
-    commG = nx.from_numpy_matrix(S)
+    commG = nx.from_numpy_array(S)
     plt.figure()
     nx.draw(commG, coordinates)
     plt.draw()

@@ -1,4 +1,7 @@
 import torch
+import numpy as np
+from scipy import sparse
+from sklearn.linear_model import LogisticRegression, Ridge
 
 EPS  = 1e-9
 
@@ -105,6 +108,39 @@ class KernelRegression:
         
         return torch.cat(grads, dim=-1)
     
+    def fit(self, x_train: list[torch.Tensor], weights: list[torch.Tensor], y_train: torch.Tensor) -> LogisticRegression | Ridge:
+        
+        grads = self.compute_gradient(x_train, weights)
+        num_signals, num_nodes, out_dim = grads.shape[:3]
+        ntk_features = grads.reshape(-1, grads.shape[-1])
+        
+        kernel_matrix = ntk_features @ ntk_features.T
+        
+        y_train_flat = y_train.reshape(-1).cpu().numpy()
+        
+        kernel_matrix_sparse = sparse.csr_matrix(kernel_matrix.cpu().numpy())
+
+        if self.logistic:
+            self.reg = LogisticRegression(
+                penalty=None,
+                fit_intercept=False,
+                max_iter=1000,
+                multi_class='multinomial',
+            )
+        
+        else:
+            self.reg = Ridge(
+                alpha=0.0,
+                fit_intercept=False,
+                solver='lsqr',
+            )
+        
+        self.kernel = kernel_matrix
+        self.reg.fit(kernel_matrix_sparse, y_train_flat)
+        
+        return self.reg
+    
+    
     def predict(
         self,
         x_train: list[torch.Tensor],
@@ -112,7 +148,26 @@ class KernelRegression:
         y_train: torch.Tensor,
         x_test: list[torch.Tensor],
         adj_matrix: torch.Tensor | None = None,
-    ) -> list[torch.Tensor]:
+    ) -> torch.Tensor:
+        
+        if self.reg is None:
+            self.fit(x_train, weights, y_train)
+        
+        test_grads = self.compute_gradient(x_test, weights, adj_matrix)
+        num_test_signals = test_grads.shape[0]
+        
+        if self.logistic:
+            assert self.kernel is not None and isinstance(self.reg, LogisticRegression)
+            phi_test = test_grads.reshape(num_test_signals, -1)
+            K_test = (phi_test @ self.kernel.T).cpu().numpy()
+            preds = self.reg.predict_proba(sparse.csr_matrix(K_test))
+            
+            return torch.from_numpy(preds).to(self.device).reshape(num_test_signals, -1)
+        
+        else:
+            assert self.kernel is not None and isinstance(self.reg, Ridge)
+            phi_test = test_grads.reshape(-1, test_grads.shape[-1])
+            K_test = (phi_test @ self.kernel.T).cpu().numpy()
         
         assert False, "This function is not implemented yet."
     
