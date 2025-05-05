@@ -155,7 +155,6 @@ class GNTKernelRegression:
             print(f"Adj shape: {adj.shape}")
             raise
         
-        # breakpoint()
         # Initialize covariance
         sigma = torch.matmul(features, features.T)
         
@@ -224,7 +223,7 @@ class GNTKernelRegression:
         # else:
         #     scale_mat = 1.0 / (adj1.sum(1) * adj2.sum(0))
         
-        adj_block = torch.kron(adj1, adj2)
+        adj_block = self._sparse_kron(adj1, adj2)
         
         jump_ntk = 0
         sigma = features1 @ features2.T
@@ -248,9 +247,9 @@ class GNTKernelRegression:
                 ntk = self._adj(ntk, adj_block, n1, n2, scale_mat)
         
         if self.jk:
-            return jump_ntk.sum() * 2
+            return jump_ntk
         else:
-            return ntk.sum() * 2
+            return ntk
     
     def fit(self, 
             train_features: List[List[torch.Tensor]], 
@@ -266,19 +265,24 @@ class GNTKernelRegression:
         # Precompute diagonals for all training graphs
         diag_lists = [self.compute_diagonal(f[0], a) for f, a in zip(train_features, train_adjs)]
         
-        # Compute kernel matrix
-        n = len(train_features)
-        kernel_matrix = torch.zeros((n, n), device=self.device)
+        # # Compute kernel matrix
+        # n = len(train_features)
+        # kernel_matrix = torch.zeros((n, n), device=self.device)
         
-        for i in range(n):
-            for j in range(i, n):
-                kernel_matrix[i,j] = self.compute_gntk(
-                    train_features[i][0], train_features[j][0],
-                    train_adjs[i], train_adjs[j],
-                    diag_lists[i], diag_lists[j]
-                )
-                if i != j:
-                    kernel_matrix[j,i] = kernel_matrix[i,j]
+        # for i in range(n):
+        #     for j in range(i, n):
+        #         kernel_matrix[i,j] = self.compute_gntk(
+        #             train_features[i][0], train_features[j][0],
+        #             train_adjs[i], train_adjs[j],
+        #             diag_lists[i], diag_lists[j]
+        #         )
+        #         if i != j:
+        #             kernel_matrix[j,i] = kernel_matrix[i,j]
+        kernel_matrix = self.compute_gntk(
+            train_features[0][0], train_features[0][0],
+            train_adjs[0], train_adjs[0],
+            diag_lists[0], diag_lists[0]
+        )
         
         # Fit regression model
         y_train = y_train.cpu().numpy()
@@ -289,7 +293,6 @@ class GNTKernelRegression:
                 penalty=None,
                 fit_intercept=False,
                 max_iter=1000,
-                multi_class='multinomial'
             ).fit(kernel_matrix_np, y_train)
         else:
             self.reg = Ridge(
@@ -327,13 +330,11 @@ class GNTKernelRegression:
         n_test = len(test_features)
         kernel_test = torch.zeros((n_test, n_train), device=self.device)
         
-        for i in range(n_test):
-            for j in range(n_train):
-                kernel_test[i,j] = self.compute_gntk(
-                    test_features[i][0], train_features[j][0],
-                    test_adjs[i], train_adjs[j],
-                    test_diags[i], train_diags[j]
-                )
+        kernel_test = self.compute_gntk(
+            test_features[0][0], train_features[0][0],
+            test_adjs[0], train_adjs[0],
+            test_diags[0], train_diags[0]
+        )
         
         # Make predictions
         if self.logistic:
