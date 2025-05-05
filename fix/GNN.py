@@ -1,135 +1,86 @@
 import torch
+from torch import nn
+import torch.nn.functional as F
 from torch_geometric.data import Data
+import math
 
-def LSIGF(weight: torch.nn.ParameterList, sparse_matrix: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    
-    k = len(weight)
-    
-    diffused_signals = [x]
-    
-    for i in range(1, k):
-        x = torch.spmm(sparse_matrix, x)
-        diffused_signals.append(x)
-    
-    output = [z @ w / torch.sqrt(torch.tensor(x.shape[1])) for z, w in zip(diffused_signals, weight)]
-    output = torch.stack(output)
-    return torch.sum(output, dim=0)
+class ScaledMLP(nn.Module):
+    """MLP with NTK-style scaling and ReLU activations."""
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, device):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        if num_layers == 1:
+            self.layers.append(nn.Linear(input_dim, output_dim, bias=False, device=device))
+        else:
+            self.layers.append(nn.Linear(input_dim, hidden_dim, bias=False, device=device))
+            for _ in range(num_layers - 2):
+                self.layers.append(nn.Linear(hidden_dim, hidden_dim, bias=False, device=device))
+            self.layers.append(nn.Linear(hidden_dim, output_dim, bias=False, device=device))
 
-class GraphFilter(torch.nn.Module):
-    
-    def __init__(self, fan_in: int, fan_out: int, k: int, normalize: bool = True, device: str = 'cpu'):
-        
-        super(GraphFilter, self).__init__()
-        self.fan_in = fan_in
-        self.fan_out = fan_out
-        self.k = k
-        self.normalize = normalize
-        self.device = device
-        
-        self.weight = torch.nn.ParameterList([
-            torch.nn.Parameter(torch.randn(self.fan_in, self.fan_out, device=self.device)) for _ in range(self.k)
-        ])
-    
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor):
-        
-        num_nodes = x.shape[0]
-        num_edges = edge_index.shape[1]
-        
-        if edge_weight is None:
-            edge_weight = torch.ones(num_edges, device=self.device)
-        
-        sparse_matrix = torch.sparse_coo_tensor(edge_index, edge_weight, (num_nodes, num_nodes))
-        
-        if self.normalize:
-            
-            s = torch.linalg.svdvals(sparse_matrix.to_dense().cpu())
-            sparse_matrix = sparse_matrix / s[0]
-        
-        return LSIGF(self.weight, sparse_matrix, x)
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            fan_in = layer.in_features
+            x = layer(x) / math.sqrt(fan_in)
+            if i < len(self.layers) - 1:
+                x = F.relu(x)
+        return x
 
-class GNN(torch.nn.Module):
-    
-    def __init__(self, name: str, gnn_type: str, architecture: list[list[int]], softmax: bool, device: str):
-        
-        super(GNN, self).__init__()
+class GNN(nn.Module):
+    """GNN modified to reflect the GNTK structure."""
+    def __init__(self, name: str, gnn_type: str, input_dim: int, hidden_dim: int, 
+                 output_dim: int, num_layers: int, num_mlp_layers: int, 
+                 softmax: bool, device: str):
+        super().__init__()
         self.name = name
         self.gnn_type = gnn_type
-        
-        assert gnn_type in ['GNN'], f"Unsupported GNN type: {gnn_type}"
-        
-        self.feature_list = architecture[0]
-        self.mlp_list = architecture[1]
-        self.K_list = architecture[2]
+        assert gnn_type == 'GNN', f"Unsupported GNN type: {gnn_type}"
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.num_layers = num_layers
+        self.num_mlp_layers = num_mlp_layers
         self.softmax = softmax
         self.device = device
-        
-        self.num_layers = len(self.feature_list) - 1
-        self.num_mlp_layers = len(self.mlp_list) - 1
-        
-        # if self.K_list is not None: 
-        assert self.num_layers == len(self.K_list), "Mismatch between number of layers and K_list length"
-        
-        self.layers = torch.nn.ModuleList()
-        self.mlp_layers = torch.nn.ModuleList()
+        self.mlps = nn.ModuleList()
         self._initialize_layers()
-    
+
     def _initialize_layers(self):
-        for i in range(self.num_layers):
-            if self.gnn_type == 'GNN':
-                assert self.K_list is not None, "K_list must be provided for GNN type"
-                self.layers.append(GraphFilter(self.feature_list[i], self.feature_list[i+1], self.K_list[i], device=self.device))
-            else:
-                raise ValueError(f"Unsupported GNN type: {self.gnn_type}")
-        
-        for i in range(self.num_mlp_layers):
-            self.mlp_layers.append(torch.nn.Linear(self.mlp_list[i], self.mlp_list[i+1], bias=False, device=self.device))
-            # torch.nn.init.xavier_uniform_(self.mlp_layers[i].weight, gain=1.0)
-    
+        """Initialize MLPs for each layer based on GNTK structure."""
+        for l in range(self.num_layers):
+            input_dim = self.input_dim if l == 0 else self.hidden_dim
+            output_dim = self.output_dim if l == self.num_layers - 1 else self.hidden_dim
+            self.mlps.append(ScaledMLP(input_dim, self.hidden_dim, output_dim, 
+                                     self.num_mlp_layers, self.device))
+
     def forward(self, data: Data, return_intermediate: bool = False):
+        """Forward pass mimicking GNTK: initial aggregation, then MLP + aggregation per layer."""
         
-        x, edge_index, edge_weight, batch = data.x, data.edge_index, data.edge_weight, data.batch
+        intermediate_outputs = []
+        x, edge_index, edge_weight = data.x, data.edge_index, data.edge_weight
+        
         assert isinstance(x, torch.Tensor)
-        
-        intermediate_outputs = [x]
-        
-        for i in range(self.num_layers):
-            x = self.layers[i](x, edge_index=edge_index, edge_weight=edge_weight)
-            x = torch.nn.functional.relu(x)
-            
+        assert isinstance(edge_index, torch.Tensor)
+        num_nodes = x.shape[0]
+        if edge_weight is None:
+            edge_weight = torch.ones(edge_index.shape[1], device=self.device)
+
+        # Build sparse adjacency matrix
+        A = torch.sparse_coo_tensor(edge_index, edge_weight, 
+                                  (num_nodes, num_nodes), device=self.device)
+
+        # Initial aggregation
+        h = torch.spmm(A, x)
+        if return_intermediate: intermediate_outputs = [h] 
+
+        # Layer-wise computation
+        for l in range(self.num_layers):
+            h = self.mlps[l](h)  # Apply MLP with ReLU
+            if l < self.num_layers - 1:
+                h = torch.spmm(A, h)  # Aggregate except for the last layer
             if return_intermediate:
-                intermediate_outputs.append(x)
-        
-        for i in range(self.num_mlp_layers):
-            x = self.mlp_layers[i](x) / torch.sqrt(torch.tensor(self.mlp_list[i]))
-            x = torch.nn.functional.relu(x)
-            
-            if return_intermediate:
-                intermediate_outputs.append(x)
-        
+                intermediate_outputs.append(h)
+
         if self.softmax:
-            x = torch.nn.functional.log_softmax(x, dim=1)
-        
-        if return_intermediate:
-            return intermediate_outputs
-        
-        return x
-    
-    def get_weights(self):
-        
-        weight_list = []
-        
-        fweights = torch.empty([self.feature_list[0], self.feature_list[1], self.K_list[0]], device=self.device)
-        
-        for i in range(self.num_layers):
-            if self.gnn_type == 'GNN':
-                fweights[:, :, i] = self.layers[0].weight[i].clone()
-        
-        weight_list.append(fweights)
-        
-        mlp_weights = torch.empty([self.mlp_list[0], self.mlp_list[1], self.num_mlp_layers], device=self.device)
-        
-        for i in range(self.num_mlp_layers):
-            mlp_weights[:, :, i] = torch.transpose(self.mlp_layers[i].weight, 0, 1)
-        
-        weight_list.append(mlp_weights)
-        return weight_list
+            h = F.log_softmax(h, dim=1)
+
+        return intermediate_outputs if return_intermediate else h

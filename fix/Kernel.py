@@ -238,7 +238,7 @@ class GNTKernelRegression:
             return ntk
     
     def fit(self, 
-            train_features: List[List[torch.Tensor]], 
+            train_features: List[torch.Tensor], 
             train_adjs: List[torch.Tensor],
             y_train: torch.Tensor) -> Union[LogisticRegression, Ridge]:
         """
@@ -249,10 +249,10 @@ class GNTKernelRegression:
             y_train: Target values
         """
         # Precompute diagonals for all training graphs
-        diag_lists = [self.compute_diagonal(f[0], a) for f, a in zip(train_features, train_adjs)]
+        diag_lists = [self.compute_diagonal(f, a) for f, a in zip(train_features, train_adjs)]
 
         kernel_matrix = self.compute_gntk(
-            train_features[0][0], train_features[0][0],
+            train_features[0], train_features[0],
             train_adjs[0], train_adjs[0],
             diag_lists[0], diag_lists[0]
         )
@@ -277,10 +277,10 @@ class GNTKernelRegression:
         return self.reg
     
     def predict(self, 
-               train_features: List[List[torch.Tensor]],
+               train_features: List[torch.Tensor],
                train_adjs: List[torch.Tensor],
                y_train: torch.Tensor,
-               test_features: List[List[torch.Tensor]],
+               test_features: List[torch.Tensor],
                test_adjs: List[torch.Tensor]) -> torch.Tensor:
         """
         Make predictions
@@ -295,8 +295,8 @@ class GNTKernelRegression:
             self.fit(train_features, train_adjs, y_train)
         
         # Precompute diagonals
-        train_diags = [self.compute_diagonal(f[0], a) for f, a in zip(train_features, train_adjs)]
-        test_diags = [self.compute_diagonal(f[0], a) for f, a in zip(test_features, test_adjs)]
+        train_diags = [self.compute_diagonal(f, a) for f, a in zip(train_features, train_adjs)]
+        test_diags = [self.compute_diagonal(f, a) for f, a in zip(test_features, test_adjs)]
         
         # Compute test-train kernel matrix
         n_train = len(train_features)
@@ -304,7 +304,7 @@ class GNTKernelRegression:
         kernel_test = torch.zeros((n_test, n_train), device=self.device)
         
         kernel_test = self.compute_gntk(
-            test_features[0][0], train_features[0][0],
+            test_features[0], train_features[0],
             test_adjs[0], train_adjs[0],
             test_diags[0], train_diags[0]
         )

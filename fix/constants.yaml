@@ -7,7 +7,7 @@ train_sample_sizes: {
 }
 
 feature_limit: {
-  'Citeseer': 1000,
+  'Citeseer': -1,
   'Cora'    : -1,
   'PubMed'  : -1,
 }
@@ -18,11 +18,9 @@ node_limit: {
   'PubMed'  : 10000,
 }
 
-GNN_architecture: {
-  'Citeseer': [[[-1, 10], [10, -1], [2]], [[-1, 50], [50, -1], [2]], [[-1, 100], [100, -1], [2]]],
-  'Cora'    : [[[-1, 10], [10, -1], [2]], [[-1, 50], [50, -1], [2]], [[-1, 100], [100, -1], [2]]],
-  'PubMed'  : [[[-1, 10], [10, -1], [2]], [[-1, 50], [50, -1], [2]], [[-1, 100], [100, -1], [2]]],
-}
+GNN_hidden_dims: [10, 50, 100, 1000]
+GNN_num_layers: [2, 3]
+GNN_num_mlp_layers: [1]
 
 train_args: {
   'batch_size'  : 32,
@@ -31,5 +29,5 @@ train_args: {
   'scheduler'   : 'none',
   'opt_restart' : 0,
   'weight_decay': 0.005,
-  'lr'          : 0.001,
+  'lr'          : 0.0001,
 }

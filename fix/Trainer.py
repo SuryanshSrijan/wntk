@@ -63,7 +63,7 @@ def train(
         
         if (epoch + 1) % 10 == 0:
             
-            val_loss = test(data, val_mask, model, logistic=logistic)
+            _, val_loss = test(data, val_mask, model, logistic=logistic)
             val_losses.append(val_loss)
             
             if val_loss < best_loss:
@@ -81,7 +81,7 @@ def test(
     test_mask: torch.Tensor,
     model: GNN,
     logistic: bool
-) -> float:
+) -> tuple[torch.Tensor, float]:
     
     model.eval()
     
@@ -92,7 +92,7 @@ def test(
     assert isinstance(label, torch.Tensor)
     
     if logistic:
-        return torch.nn.functional.cross_entropy(pred[test_mask], label[test_mask]).cpu().item()
+        return pred[test_mask], torch.nn.functional.cross_entropy(pred[test_mask], label[test_mask]).cpu().item()
     else:
-        return torch.nn.functional.mse_loss(pred.view(-1, 1), label.view(-1, 1), reduction='sum').cpu().item()
+        return pred[test_mask], torch.nn.functional.mse_loss(pred.view(-1, 1), label.view(-1, 1), reduction='sum').cpu().item()
     
