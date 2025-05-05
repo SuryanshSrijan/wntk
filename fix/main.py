@@ -159,7 +159,7 @@ def main():
         arch[-2][-1] = num_classes  # Set output dimension
     
     num_realizations = CONSTANTS['num_realizations']
-    train_args = CONSTANTS['train_args'][args.dataset]
+    train_args = CONSTANTS['train_args']
     
     # Initialize result storage
     results = {

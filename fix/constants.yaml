@@ -25,13 +25,11 @@ GNN_architecture: {
 }
 
 train_args: {
-  'Citeseer': {
-    'batch_size'  : 32,
-    'epochs'      : 500,
-    'opt'         : 'adam',
-    'scheduler'   : 'none',
-    'opt_restart' : 0,
-    'weight_decay': 0.005,
-    'lr'          : 0.001,
-  }
+  'batch_size'  : 32,
+  'epochs'      : 500,
+  'opt'         : 'adam',
+  'scheduler'   : 'none',
+  'opt_restart' : 0,
+  'weight_decay': 0.005,
+  'lr'          : 0.001,
 }
