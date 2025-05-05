@@ -190,7 +190,7 @@ def main():
             for arch_idx, arch in enumerate(gnn_architectures):
                 print(f"Architecture {arch_idx+1}/{len(gnn_architectures)}")
                 
-                breakpoint()
+                # breakpoint()
                 # Initialize GNN
                 gnn = GNN(f"gnn{arch_idx}", 'GNN', arch, False, device=DEVICE)
                 original_gnn = copy.deepcopy(gnn)
@@ -210,14 +210,14 @@ def main():
                 
                 # Prepare GNTK
                 num_layers = len(arch) - 1  # Number of GNN layers
-                num_mlp_layers = 1  # Assuming 1 MLP per GNN layer
+                num_mlp_layers = 1 
                 
                 # Get features for kernel
                 train_feats, train_y = get_features(sub_data, sub_data.train_mask, original_gnn)
                 test_feats, test_y = get_features(sub_data, sub_data.test_mask, original_gnn)
                 full_feats, full_y = get_features(data, data.test_mask, original_gnn)
                 
-                breakpoint()
+                # breakpoint()
                 # Initialize GNTK
                 gntk = GNTKernelRegression(
                     num_layers=num_layers,
@@ -230,26 +230,26 @@ def main():
                 
                 # Fit GNTK
                 gntk.fit(
-                    train_features=[f[0] for f in train_feats],  # Remove batch dim
-                    train_adjs=[sub_adj],
+                    train_features=[[f[0] for f in train_feats]],  # Remove batch dim
+                    train_adjs=[sub_adj[sub_data.train_mask][:, sub_data.train_mask]],
                     y_train=train_y
                 )
                 
                 # Evaluate GNTK
                 test_preds = gntk.predict(
-                    train_features=[f[0] for f in train_feats],
-                    train_adjs=[sub_adj],
+                    train_features=[[f[0] for f in train_feats]],
+                    train_adjs=[sub_adj[sub_data.train_mask][:, sub_data.train_mask]],
                     y_train=train_y,
-                    test_features=[f[0] for f in test_feats],
-                    test_adjs=[sub_adj]
+                    test_features=[[f[0] for f in test_feats]],
+                    test_adjs=[sub_adj[sub_data.test_mask][:, sub_data.test_mask]]
                 )
                 
                 transfer_preds = gntk.predict(
-                    train_features=[f[0] for f in train_feats],
-                    train_adjs=[sub_adj],
+                    train_features=[[f[0] for f in train_feats]],
+                    train_adjs=[sub_adj[sub_data.train_mask][:, sub_data.train_mask]],
                     y_train=train_y,
-                    test_features=[f[0] for f in full_feats],
-                    test_adjs=[full_adj]
+                    test_features=[[f[0] for f in full_feats]],
+                    test_adjs=[full_adj[data.test_mask][:, data.test_mask]]
                 )
                 
                 # Calculate accuracies
