@@ -20,8 +20,8 @@ class KernelRegression:
         
     def compute_gradient(self, x: list[torch.Tensor], weights: list[torch.Tensor], adj_mat: torch.Tensor | None = None) -> torch.Tensor:
         
-        num_signals = x[0].shape[0]
-        num_nodes = x[0].shape[1]
+        num_signals = x[0].shape[0]         # S
+        num_nodes = x[0].shape[1]           # N
         
         for i in range(self.num_layers + 1):
             assert x[i].ndim == 3
@@ -36,14 +36,14 @@ class KernelRegression:
             assert weights[i].shape[2] == self.num_filters[i]
         
         if adj_mat is None:
-            adj_mat = self.adj_matrix
+            adj_mat = self.adj_matrix                                       # [N x N]
         
         assert adj_mat.ndim == 2
         assert adj_mat.shape[0] == num_nodes
         assert adj_mat.shape[1] == num_nodes
         
         max_num_filters = max(self.num_filters)
-        adj_mat_powers = [torch.eye(num_nodes, device=self.device)]
+        adj_mat_powers = [torch.eye(num_nodes, device=self.device)]         # [N x N]
         for i in range(1, max_num_filters):
             adj_mat_powers.append(torch.matmul(adj_mat_powers[-1], adj_mat))
         
@@ -51,7 +51,7 @@ class KernelRegression:
         
         for l in range(self.num_layers):
             
-            grad_l = torch.zeros(
+            grad_l = torch.zeros(                                           # [S x N x F[l+1] x F[l] x K]
                 num_signals, num_nodes, self.filter_widths[l + 1], 
                 self.filter_widths[l], self.num_filters[l],
                 device=self.device
@@ -59,28 +59,30 @@ class KernelRegression:
             
             for k in range(self.num_filters[l]):
                 
-                grad_l[:, :, :, :, k] = torch.einsum(
+                grad_l[:, :, :, :, k] = torch.einsum(                       # [S x N x F[l]]
                     'nm,smf->snf',
                     adj_mat_powers[k],
                     x[l]
-                ).unsqueeze(2).expand(-1, -1, self.filter_widths[l + 1], -1)
+                ).unsqueeze(2).expand(-1, -1, self.filter_widths[l + 1], -1)   # [S x N x F[l+1] x F[l]]
         
             if l < self.num_layers - 1:
                 grad_l = grad_l * (grad_l > 0).float()
             
             for l2 in range(l + 1, self.num_layers):
                 
-                grad_reshaped = grad_l.reshape(
+                grad_reshaped = grad_l.reshape(                         # [S x N x F[l+1] x F[l] x K] -> [S x N x F[l+1]*K x F[l]]
                     num_signals, num_nodes,
                     self.filter_widths[l + 1] * self.num_filters[l],
                     self.filter_widths[l] 
                 )
                 
+                # Gadbad
+                
                 grad_l = torch.einsum(
                     'snil,ijk->snjk',
-                    grad_reshaped,
-                    weights[l2].reshape(self.filter_widths[l2], -1)
-                )
+                    grad_reshaped,                                      # [S x N x F[l+1]*K x F[l]]
+                    weights[l2].reshape(-1, self.filter_widths[l2])     # [F[l2] x F[l2+1] x K] -> 
+                )                                                                   # [S x N x F[l+1] x F[l] x K]
                 
                 if l2 < self.num_layers - 1:
                     grad_l = grad_l * (grad_l > 0).float()
@@ -149,28 +151,72 @@ class KernelRegression:
         x_test: list[torch.Tensor],
         adj_matrix: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Make predictions using the trained kernel model.
         
+        Args:
+            x_train: Training activations (used if model not yet fitted)
+            weights: Model weights
+            y_train: Training targets
+            x_test: Test activations
+            adj_matrix: Optional test adjacency matrix
+            
+        Returns:
+            Predictions tensor:
+            - Classification: [N_test x n] of class probabilities
+            - Regression: [N_test x n x F_out] of predictions
+        """
         if self.reg is None:
             self.fit(x_train, weights, y_train)
         
+        assert self.kernel is not None
+        
+        # Compute test features
         test_grads = self.compute_gradient(x_test, weights, adj_matrix)
         num_test_signals = test_grads.shape[0]
         
         if self.logistic:
-            assert self.kernel is not None and isinstance(self.reg, LogisticRegression)
-            phi_test = test_grads.reshape(num_test_signals, -1)
-            K_test = (phi_test @ self.kernel.T).cpu().numpy()
-            preds = self.reg.predict_proba(sparse.csr_matrix(K_test))
+            # Classification case
+            assert isinstance(self.reg, LogisticRegression)
+            phi_test = test_grads.reshape(num_test_signals, -1)  # [N_test x (n*F_out*params)]
+            phi_train = self.kernel.reshape(-1, self.kernel.shape[-1])  # [N_train*n*F_out x params]
             
+            K_test = phi_test @ phi_train.T  # [N_test x N_train*n*F_out]
+            preds = self.reg.predict_proba(sparse.csr_matrix(K_test.cpu().numpy()))
             return torch.from_numpy(preds).to(self.device).reshape(num_test_signals, -1)
         
         else:
-            assert self.kernel is not None and isinstance(self.reg, Ridge)
-            phi_test = test_grads.reshape(-1, test_grads.shape[-1])
-            K_test = (phi_test @ self.kernel.T).cpu().numpy()
+            # Regression case
+            assert isinstance(self.reg, Ridge)
+            phi_test = test_grads.reshape(-1, test_grads.shape[-1])  # [N_test*n*F_out x params]
+            phi_train = self.kernel.reshape(-1, self.kernel.shape[-1])  # [N_train*n*F_out x params]
+            
+            K_test = phi_test @ phi_train.T  # [N_test*n*F_out x N_train*n*F_out]
+            preds = self.reg.predict(sparse.csr_matrix(K_test.cpu().numpy()))
+            
+            # Reshape to [N_test x n x F_out]
+            return torch.from_numpy(preds).to(self.device).reshape(
+                num_test_signals, -1, self.filter_widths[-1]
+            )
+
+    def get_eigenvalues(self, k: int = 6) -> torch.Tensor:
+        """Compute top eigenvalues of the kernel matrix.
         
-        assert False, "This function is not implemented yet."
-    
-    def get_eigenvalues(self) -> torch.Tensor:
+        Args:
+            k: Number of eigenvalues to return
+            
+        Returns:
+            Tensor of top k eigenvalues in descending order
+        """
+        if self.kernel is None:
+            raise ValueError("Must call fit() before getting eigenvalues")
+            
+        # Convert to dense if sparse (though your current code stores it as dense)
+        kernel_matrix = self.kernel.cpu().numpy()
+        if sparse.issparse(kernel_matrix):
+            kernel_matrix = kernel_matrix.toarray()
         
-        assert False, "This function is not implemented yet."
+        # Compute eigenvalues (using torch for device consistency)
+        eigvals = torch.linalg.eigvalsh(torch.from_numpy(kernel_matrix))
+        
+        # Return top k eigenvalues in descending order
+        return eigvals.to(self.device)[-k:].flip(0)

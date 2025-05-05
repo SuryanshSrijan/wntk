@@ -211,12 +211,14 @@ def main():
                 feats_train, _                  = get_features(sampled_data, sampled_data.train_mask, original_model, best_model)
                 feats_test, test_preds          = get_features(sampled_data, sampled_data.test_mask, original_model, best_model)
                 feats_all_test, all_test_preds  = get_features(all_data, all_data.test_mask, original_model, best_model)
+                
+                train_adjoint_matrix = adjoint_matrix[sampled_data.train_mask][:, sampled_data.train_mask]
                     
                 consF = model.feature_list[:-1] + model.mlp_list
                 consK = model.K_list + [1] * model.num_mlp_layers
                 
                 kernel = KernelRegression(
-                    len(consF) - 1, consK, consF, adjoint_matrix, logistic=True
+                    len(consF) - 1, consK, consF, train_adjoint_matrix, logistic=True, device=DEVICE
                 )
                 
                 weight_list = original_model.get_weights()
