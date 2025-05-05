@@ -2,221 +2,249 @@ import torch
 import numpy as np
 from scipy import sparse
 from sklearn.linear_model import LogisticRegression, Ridge
+from typing import List, Optional, Union
 
-EPS  = 1e-9
+EPS = 1e-9
 
-class KernelRegression:
+class GNTKernelRegression:
+    """
+    Graph Neural Tangent Kernel Regression with integrated GNTK computation
+    """
     
-    def __init__(self, num_layers: int, num_filters: list[int], filter_widths: list[int], adj_matrix: torch.Tensor, logistic: bool = False, device: str = 'cpu'):
-        
+    def __init__(self, 
+                 num_layers: int, 
+                 num_mlp_layers: int,
+                 jk: bool = False,
+                 scale: str = 'degree',
+                 logistic: bool = False, 
+                 device: str = 'cpu'):
+        """
+        Args:
+            num_layers: Number of GNN layers
+            num_mlp_layers: Number of MLP layers per GNN layer
+            jk: Whether to use jumping knowledge (sum over all layers)
+            scale: Scaling method for adjacency ('uniform' or 'degree')
+            logistic: Whether to use logistic regression
+            device: Computation device
+        """
         self.num_layers = num_layers
-        self.num_filters = num_filters
-        self.filter_widths = filter_widths
-        self.adj_matrix = adj_matrix
+        self.num_mlp_layers = num_mlp_layers
+        self.jk = jk
+        self.scale = scale
         self.logistic = logistic
+        self.device = device
         self.kernel = None
         self.reg = None
-        self.device = device
         
-    def compute_gradient(self, x: list[torch.Tensor], weights: list[torch.Tensor], adj_mat: torch.Tensor | None = None) -> torch.Tensor:
+        assert scale in ['uniform', 'degree'], "Scale must be 'uniform' or 'degree'"
         
-        num_signals = x[0].shape[0]         # S
-        num_nodes = x[0].shape[1]           # N
+    def _next_diag(self, S: torch.Tensor) -> tuple:
+        """Process diagonal elements through a normal layer"""
+        diag = torch.sqrt(torch.diag(S))
+        S = S / diag[:, None] / diag[None, :]
+        S = torch.clamp(S, -1, 1)
         
-        for i in range(self.num_layers + 1):
-            assert x[i].ndim == 3
-            assert x[i].shape[0] == num_signals
-            assert x[i].shape[1] == num_nodes
-            assert x[i].shape[2] == self.filter_widths[i]
-        
-        for i in range(self.num_layers):
-            assert weights[i].ndim == 3
-            assert weights[i].shape[0] == self.filter_widths[i]
-            assert weights[i].shape[1] == self.filter_widths[i + 1]
-            assert weights[i].shape[2] == self.num_filters[i]
-        
-        if adj_mat is None:
-            adj_mat = self.adj_matrix                                       # [N x N]
-        
-        assert adj_mat.ndim == 2
-        assert adj_mat.shape[0] == num_nodes
-        assert adj_mat.shape[1] == num_nodes
-        
-        max_num_filters = max(self.num_filters)
-        adj_mat_powers = [torch.eye(num_nodes, device=self.device)]         # [N x N]
-        for i in range(1, max_num_filters):
-            adj_mat_powers.append(torch.matmul(adj_mat_powers[-1], adj_mat))
-        
-        grads = []
-        
-        for l in range(self.num_layers):
-            
-            grad_l = torch.zeros(                                           # [S x N x F[l+1] x F[l] x K]
-                num_signals, num_nodes, self.filter_widths[l + 1], 
-                self.filter_widths[l], self.num_filters[l],
-                device=self.device
-            )
-            
-            for k in range(self.num_filters[l]):
-                
-                grad_l[:, :, :, :, k] = torch.einsum(                       # [S x N x F[l]]
-                    'nm,smf->snf',
-                    adj_mat_powers[k],
-                    x[l]
-                ).unsqueeze(2).expand(-1, -1, self.filter_widths[l + 1], -1)   # [S x N x F[l+1] x F[l]]
-        
-            if l < self.num_layers - 1:
-                grad_l = grad_l * (grad_l > 0).float()
-            
-            for l2 in range(l + 1, self.num_layers):
-                
-                grad_reshaped = grad_l.reshape(                         # [S x N x F[l+1] x F[l] x K] -> [S x N x F[l+1]*K x F[l]]
-                    num_signals, num_nodes,
-                    self.filter_widths[l + 1] * self.num_filters[l],
-                    self.filter_widths[l] 
-                )
-                
-                # Gadbad
-                
-                grad_l = torch.einsum(
-                    'snil,ijk->snjk',
-                    grad_reshaped,                                      # [S x N x F[l+1]*K x F[l]]
-                    weights[l2].reshape(-1, self.filter_widths[l2])     # [F[l2] x F[l2+1] x K] -> 
-                )                                                                   # [S x N x F[l+1] x F[l] x K]
-                
-                if l2 < self.num_layers - 1:
-                    grad_l = grad_l * (grad_l > 0).float()
-            
-            grad_l = grad_l.reshape(
-                num_signals, num_nodes, self.filter_widths[-1], -1
-            )
-            
-            if self.logistic:
-                
-                y = torch.nn.functional.softmax(x[-1])
-                y_flat = y.reshape(-1, self.filter_widths[-1])
-                soft = torch.einsum(
-                    'bi,bj->bij',
-                    y_flat, y_flat
-                )
-                diag = torch.diag_embed(y_flat * (1 - y_flat))
-                grad_l = torch.einsum(
-                    'bij,bj->bi',
-                    diag - soft,
-                    grad_l.reshape(-1, self.filter_widths[-1])
-                ).reshape(grad_l.shape)
-            
-            grads.append(grad_l)
-        
-        return torch.cat(grads, dim=-1)
+        # Compute derivative of ReLU activation
+        DS = (torch.pi - torch.arccos(S)) / torch.pi
+        S = (S * (torch.pi - torch.arccos(S)) + torch.sqrt(1 - S**2)) / torch.pi
+        S = S * diag[:, None] * diag[None, :]
+        return S, DS, diag
     
-    def fit(self, x_train: list[torch.Tensor], weights: list[torch.Tensor], y_train: torch.Tensor) -> LogisticRegression | Ridge:
+    def _adj_diag(self, S: torch.Tensor, adj_block: torch.Tensor, N: int, scale_mat: torch.Tensor) -> torch.Tensor:
+        """Process diagonal elements through adjacency layer"""
+        return (adj_block @ S.reshape(-1)).reshape(N, N) * scale_mat
+    
+    def _next(self, S: torch.Tensor, diag1: torch.Tensor, diag2: torch.Tensor) -> tuple:
+        """Process all elements through a normal layer"""
+        S = S / diag1[:, None] / diag2[None, :]
+        S = torch.clamp(S, -1, 1)
+        DS = (torch.pi - torch.arccos(S)) / torch.pi
+        S = (S * (torch.pi - torch.arccos(S)) + torch.sqrt(1 - S**2)) / torch.pi
+        S = S * diag1[:, None] * diag2[None, :]
+        return S, DS
+    
+    def _adj(self, S: torch.Tensor, adj_block: torch.Tensor, N1: int, N2: int, scale_mat: torch.Tensor) -> torch.Tensor:
+        """Process all elements through adjacency layer"""
+        return (adj_block @ S.reshape(-1)).reshape(N1, N2) * scale_mat
+    
+    def compute_diagonal(self, features: torch.Tensor, adj_matrix: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Compute diagonal elements of GNTK for a single graph
+        Args:
+            features: Node features [N x F]
+            adj_matrix: Adjacency matrix [N x N]
+        Returns:
+            List of diagonal elements for each layer
+        """
+        N = adj_matrix.shape[0]
+        if self.scale == 'uniform':
+            scale_mat = torch.Tensor(1.0)
+        else:
+            scale_mat = 1.0 / (adj_matrix.sum(1) * adj_matrix.sum(0))
         
-        grads = self.compute_gradient(x_train, weights)
-        num_signals, num_nodes, out_dim = grads.shape[:3]
-        ntk_features = grads.reshape(-1, grads.shape[-1])
+        adj_block = torch.kron(adj_matrix, adj_matrix)
+        sigma = features @ features.T
+        sigma = self._adj_diag(sigma, adj_block, N, scale_mat)
+        diag_list = []
         
-        kernel_matrix = ntk_features @ ntk_features.T
+        for layer in range(1, self.num_layers):
+            for mlp_layer in range(self.num_mlp_layers):
+                sigma, _, diag = self._next_diag(sigma)
+                diag_list.append(diag)
+            
+            if layer != self.num_layers - 1:
+                sigma = self._adj_diag(sigma, adj_block, N, scale_mat)
+                
+        return diag_list
+    
+    def compute_gntk(self, 
+                   features1: torch.Tensor, 
+                   features2: torch.Tensor,
+                   adj1: torch.Tensor,
+                   adj2: torch.Tensor,
+                   diag_list1: List[torch.Tensor],
+                   diag_list2: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Compute GNTK between two graphs
+        Args:
+            features1/2: Node features [N x F]
+            adj1/2: Adjacency matrices [N x N]
+            diag_list1/2: Diagonal elements from compute_diagonal()
+        Returns:
+            GNTK value
+        """
+        n1, n2 = adj1.shape[0], adj2.shape[0]
         
-        y_train_flat = y_train.reshape(-1).cpu().numpy()
+        if self.scale == 'uniform':
+            scale_mat = torch.tensor(1.0)
+        else:
+            scale_mat = 1.0 / (adj1.sum(1) * adj2.sum(0))
         
-        kernel_matrix_sparse = sparse.csr_matrix(kernel_matrix.cpu().numpy())
-
+        adj_block = torch.kron(adj1, adj2)
+        
+        jump_ntk = 0
+        sigma = features1 @ features2.T
+        jump_ntk += sigma
+        sigma = self._adj(sigma, adj_block, n1, n2, scale_mat)
+        ntk = sigma.clone()
+        
+        for layer in range(1, self.num_layers):
+            for mlp_layer in range(self.num_mlp_layers):
+                sigma, dot_sigma = self._next(
+                    sigma,
+                    diag_list1[(layer-1)*self.num_mlp_layers + mlp_layer],
+                    diag_list2[(layer-1)*self.num_mlp_layers + mlp_layer]
+                )
+                ntk = ntk * dot_sigma + sigma
+            
+            jump_ntk += ntk
+            
+            if layer != self.num_layers - 1:
+                sigma = self._adj(sigma, adj_block, n1, n2, scale_mat)
+                ntk = self._adj(ntk, adj_block, n1, n2, scale_mat)
+        
+        if self.jk:
+            return jump_ntk.sum() * 2
+        else:
+            return ntk.sum() * 2
+    
+    def fit(self, 
+            train_features: List[torch.Tensor], 
+            train_adjs: List[torch.Tensor],
+            y_train: torch.Tensor) -> Union[LogisticRegression, Ridge]:
+        """
+        Fit kernel regression model
+        Args:
+            train_features: List of node feature matrices
+            train_adjs: List of adjacency matrices
+            y_train: Target values
+        """
+        # Precompute diagonals for all training graphs
+        diag_lists = [self.compute_diagonal(f, a) for f, a in zip(train_features, train_adjs)]
+        
+        # Compute kernel matrix
+        n = len(train_features)
+        kernel_matrix = torch.zeros((n, n), device=self.device)
+        
+        for i in range(n):
+            for j in range(i, n):
+                kernel_matrix[i,j] = self.compute_gntk(
+                    train_features[i], train_features[j],
+                    train_adjs[i], train_adjs[j],
+                    diag_lists[i], diag_lists[j]
+                )
+                if i != j:
+                    kernel_matrix[j,i] = kernel_matrix[i,j]
+        
+        # Fit regression model
+        y_train = y_train.cpu().numpy()
+        kernel_matrix_np = kernel_matrix.cpu().numpy()
+        
         if self.logistic:
             self.reg = LogisticRegression(
                 penalty=None,
                 fit_intercept=False,
                 max_iter=1000,
-                multi_class='multinomial',
-            )
-        
+                multi_class='multinomial'
+            ).fit(kernel_matrix_np, y_train)
         else:
             self.reg = Ridge(
                 alpha=0.0,
-                fit_intercept=False,
-                solver='lsqr',
-            )
+                fit_intercept=False
+            ).fit(kernel_matrix_np, y_train)
         
         self.kernel = kernel_matrix
-        self.reg.fit(kernel_matrix_sparse, y_train_flat)
-        
         return self.reg
     
-    
-    def predict(
-        self,
-        x_train: list[torch.Tensor],
-        weights: list[torch.Tensor],
-        y_train: torch.Tensor,
-        x_test: list[torch.Tensor],
-        adj_matrix: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Make predictions using the trained kernel model.
-        
+    def predict(self, 
+               train_features: List[torch.Tensor],
+               train_adjs: List[torch.Tensor],
+               y_train: torch.Tensor,
+               test_features: List[torch.Tensor],
+               test_adjs: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Make predictions
         Args:
-            x_train: Training activations (used if model not yet fitted)
-            weights: Model weights
+            train_features/test_features: Node features
+            train_adjs/test_adjs: Adjacency matrices
             y_train: Training targets
-            x_test: Test activations
-            adj_matrix: Optional test adjacency matrix
-            
         Returns:
-            Predictions tensor:
-            - Classification: [N_test x n] of class probabilities
-            - Regression: [N_test x n x F_out] of predictions
+            Predictions
         """
         if self.reg is None:
-            self.fit(x_train, weights, y_train)
+            self.fit(train_features, train_adjs, y_train)
         
-        assert self.kernel is not None
+        # Precompute diagonals
+        train_diags = [self.compute_diagonal(f, a) for f, a in zip(train_features, train_adjs)]
+        test_diags = [self.compute_diagonal(f, a) for f, a in zip(test_features, test_adjs)]
         
-        # Compute test features
-        test_grads = self.compute_gradient(x_test, weights, adj_matrix)
-        num_test_signals = test_grads.shape[0]
+        # Compute test-train kernel matrix
+        n_train = len(train_features)
+        n_test = len(test_features)
+        kernel_test = torch.zeros((n_test, n_train), device=self.device)
         
+        for i in range(n_test):
+            for j in range(n_train):
+                kernel_test[i,j] = self.compute_gntk(
+                    test_features[i], train_features[j],
+                    test_adjs[i], train_adjs[j],
+                    test_diags[i], train_diags[j]
+                )
+        
+        # Make predictions
         if self.logistic:
-            # Classification case
             assert isinstance(self.reg, LogisticRegression)
-            phi_test = test_grads.reshape(num_test_signals, -1)  # [N_test x (n*F_out*params)]
-            phi_train = self.kernel.reshape(-1, self.kernel.shape[-1])  # [N_train*n*F_out x params]
-            
-            K_test = phi_test @ phi_train.T  # [N_test x N_train*n*F_out]
-            preds = self.reg.predict_proba(sparse.csr_matrix(K_test.cpu().numpy()))
-            return torch.from_numpy(preds).to(self.device).reshape(num_test_signals, -1)
-        
+            preds = self.reg.predict_proba(kernel_test.cpu().numpy())
         else:
-            # Regression case
             assert isinstance(self.reg, Ridge)
-            phi_test = test_grads.reshape(-1, test_grads.shape[-1])  # [N_test*n*F_out x params]
-            phi_train = self.kernel.reshape(-1, self.kernel.shape[-1])  # [N_train*n*F_out x params]
-            
-            K_test = phi_test @ phi_train.T  # [N_test*n*F_out x N_train*n*F_out]
-            preds = self.reg.predict(sparse.csr_matrix(K_test.cpu().numpy()))
-            
-            # Reshape to [N_test x n x F_out]
-            return torch.from_numpy(preds).to(self.device).reshape(
-                num_test_signals, -1, self.filter_widths[-1]
-            )
-
+            preds = self.reg.predict(kernel_test.cpu().numpy())
+        
+        return torch.from_numpy(preds).to(self.device)
+    
     def get_eigenvalues(self, k: int = 6) -> torch.Tensor:
-        """Compute top eigenvalues of the kernel matrix.
-        
-        Args:
-            k: Number of eigenvalues to return
-            
-        Returns:
-            Tensor of top k eigenvalues in descending order
-        """
+        """Compute top eigenvalues of the kernel matrix"""
         if self.kernel is None:
-            raise ValueError("Must call fit() before getting eigenvalues")
-            
-        # Convert to dense if sparse (though your current code stores it as dense)
-        kernel_matrix = self.kernel.cpu().numpy()
-        if sparse.issparse(kernel_matrix):
-            kernel_matrix = kernel_matrix.toarray()
+            raise ValueError("Must call fit() first")
         
-        # Compute eigenvalues (using torch for device consistency)
-        eigvals = torch.linalg.eigvalsh(torch.from_numpy(kernel_matrix))
-        
-        # Return top k eigenvalues in descending order
-        return eigvals.to(self.device)[-k:].flip(0)
+        eigvals = torch.linalg.eigvalsh(self.kernel)
+        return eigvals[-k:].flip(0)

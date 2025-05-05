@@ -6,6 +6,7 @@ import pickle as pkl
 import argparse
 import yaml
 import copy
+from typing import List, Tuple, Dict, Any
 
 from torch_geometric.data import Data
 from torch_geometric.datasets import Planetoid
@@ -15,25 +16,24 @@ import matplotlib.pyplot as plt
 
 from GNN import GNN
 from Trainer import train, test
-from Kernel import KernelRegression
-
-# import os
-# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+from Kernel import GNTKernelRegression  # Changed to use our new GNTK implementation
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+# Load constants
 constants_file = os.path.join(os.path.dirname(__file__), 'constants.yaml')
 with open(constants_file, 'r') as file:
     CONSTANTS = yaml.safe_load(file)
 
-def set_seed(seed):
+def set_seed(seed: int) -> None:
+    """Set random seed for reproducibility"""
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def create_balanced_masks(y: torch.Tensor, num_classes: int, sample_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    
+def create_balanced_masks(y: torch.Tensor, num_classes: int, sample_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create balanced train/val/test masks"""
     train_mask = torch.zeros_like(y, dtype=torch.bool)
     val_mask = torch.zeros_like(y, dtype=torch.bool)
     test_mask = torch.zeros_like(y, dtype=torch.bool)
@@ -54,20 +54,20 @@ def create_balanced_masks(y: torch.Tensor, num_classes: int, sample_size: int) -
     return train_mask, val_mask, test_mask
 
 def sample_subgraph(data: Data, sample_size: int) -> Data:
-    
+    """Sample a k-hop subgraph with balanced classes"""
     assert isinstance(data.x, torch.Tensor)
     assert isinstance(data.y, torch.Tensor)
     assert isinstance(data.edge_index, torch.Tensor)
+    
     num_classes = data.y.max().item() + 1
     assert isinstance(num_classes, int)
-    assert isinstance(data.num_nodes, int)
     
     while True:
-
+        assert isinstance(data.num_nodes, int)
         seed = torch.randint(0, data.num_nodes, (1,), device=DEVICE)
         node_idx, edge_index, _, _ = torch_geometric.utils.k_hop_subgraph(
             seed.tolist(), num_hops=sample_size, edge_index=data.edge_index,
-            relabel_nodes=True
+            relabel_nodes=True, num_nodes=data.num_nodes
         )
 
         if node_idx.size(0) < sample_size:
@@ -80,7 +80,7 @@ def sample_subgraph(data: Data, sample_size: int) -> Data:
         edge_mask = selected_mask[data.edge_index[0]] & selected_mask[data.edge_index[1]]
         edge_index = data.edge_index[:, edge_mask]
 
-        relabeled_edge_index, relabeled_mapping = torch_geometric.utils.subgraph(
+        relabeled_edge_index, *_ = torch_geometric.utils.subgraph(
             selected_mask, data.edge_index, relabel_nodes=True
         )
         
@@ -89,166 +89,185 @@ def sample_subgraph(data: Data, sample_size: int) -> Data:
         )
         
         sampled_data = Data(
-            x = data.x[selected],
-            edge_index = relabeled_edge_index,
-            y = data.y[selected],
-            train_mask = train_mask,
-            val_mask = val_mask,
-            test_mask = test_mask,
+            x=data.x[selected],
+            edge_index=relabeled_edge_index,
+            y=data.y[selected],
+            train_mask=train_mask,
+            val_mask=val_mask,
+            test_mask=test_mask,
         ).to(DEVICE)
         
         assert isinstance(sampled_data.y, torch.Tensor)
         if all((sampled_data.y[sampled_data.train_mask] == cls).sum() > 0 for cls in range(num_classes)):
             return sampled_data
 
-def get_features(data: Data, mask: torch.Tensor, model: GNN, best_model: GNN) -> tuple[list[torch.Tensor], torch.Tensor]:
-    
-    features = []
-    good_nodes = len(mask[mask == True])
+def get_features(data: Data, mask: torch.Tensor, model: GNN) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """Extract intermediate features from GNN"""
+    features = model(data, return_intermediate=True)
     
     assert isinstance(data.y, torch.Tensor)
-    y_test = data.y.detach()[mask]
-    y_test = torch.reshape(y_test, (1, good_nodes, -1))
+    y = data.y[mask]
     
-    features = model(data, return_intermediate=True)
-    preds = best_model(data)[mask]
-    preds = torch.reshape(preds, (1, good_nodes, -1)).detach()
+    # Process features for kernel
+    processed_features = []
+    for feat in features:
+        feat_masked = feat[mask].unsqueeze(0)  # Add batch dimension
+        processed_features.append(feat_masked)
     
-    for i in range(len(features)):
-        features[i] = torch.reshape(features[i][mask], (1, good_nodes, -1)).detach()
-    
-    return features, preds
+    return processed_features, y
 
 def main():
-    
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='Citeseer')
+    parser.add_argument('--dataset', type=str, default='Citeseer', choices=['Cora', 'Citeseer', 'PubMed'])
     parser.add_argument('--seed', type=int, default=786)
+    parser.add_argument('--jk', action='store_true', help='Use jumping knowledge in GNTK')
+    parser.add_argument('--scale', type=str, default='degree', choices=['uniform', 'degree'])
     args = parser.parse_args()
     
-    assert args.dataset in ['Cora', 'Citeseer', 'PubMed'], "Dataset not supported. Choose from ['Cora', 'Citeseer', 'PubMed']"
     set_seed(args.seed)
     
-    dataset = Planetoid(root=f'/tmp/{args.dataset}', name=args.dataset, split='full').to(DEVICE)
+    # Load dataset
+    dataset = Planetoid(root=f'/tmp/{args.dataset}', name=args.dataset, split='full')
+    data = dataset[0]
+    assert isinstance(data, Data)
+    data = data.to(DEVICE)
     
-    all_data = dataset[0]
-    assert isinstance(all_data, Data)
-    all_data = all_data.to(DEVICE)
-    
-    train_subgraph_size: list[int] = CONSTANTS['train_sample_sizes'][args.dataset]
-    
+    # Get parameters from constants
+    train_subgraph_sizes: List[int] = CONSTANTS['train_sample_sizes'][args.dataset]
     feature_limit: int = CONSTANTS['feature_limit'][args.dataset]    
     if feature_limit == -1: 
         feature_limit = dataset.num_features
     
     num_classes: int = dataset.num_classes
     num_features: int = dataset.num_features
+    assert isinstance(data.num_nodes, int)
+    assert isinstance(data.edge_index, torch.Tensor)
     
-    assert isinstance(all_data.num_nodes, int)
-    num_nodes = all_data.num_nodes
+    # Prepare full graph adjacency
+    edge_weights = torch.full((data.num_edges,), 1.0 / data.num_nodes, device=DEVICE)
+    full_adj = torch.sparse_coo_tensor(
+        data.edge_index, edge_weights, 
+        (data.num_nodes, data.num_nodes), device=DEVICE
+    ).to_dense()
     
-    assert isinstance(all_data.edge_index, torch.Tensor)
-    edge_list = all_data.edge_index.clone().to(DEVICE)
-    
-    assert edge_list.ndim == 2 and edge_list.shape[0] == 2
-    assert edge_list.shape[1] == all_data.num_edges
-
-    num_edges: int = edge_list.shape[1]
-    edge_weights: torch.Tensor = torch.full((num_edges,), 1.0 / num_nodes, device=DEVICE)
-    all_adjoint_matrix: torch.Tensor = torch.sparse_coo_tensor(edge_list, edge_weights, (num_nodes, num_nodes), device=DEVICE).to_dense()
-        
-    GNN_architectures: list[list[list[int]]] = CONSTANTS['GNN_architecture'][args.dataset]
-    num_models = len(GNN_architectures)
-    
-    for i in range(num_models):
-        GNN_architectures[i][0][0] = num_features
-        GNN_architectures[i][-2][-1] = num_classes    
+    # Prepare GNN architectures
+    gnn_architectures: List[List[List[int]]] = CONSTANTS['GNN_architecture'][args.dataset]
+    for arch in gnn_architectures:
+        arch[0][0] = num_features  # Set input dimension
+        arch[-2][-1] = num_classes  # Set output dimension
     
     num_realizations = CONSTANTS['num_realizations']
-    
     train_args = CONSTANTS['train_args'][args.dataset]
     
-    gnn_results             = np.zeros((num_realizations, len(train_subgraph_size), num_models))
-    gnn_transf_results      = np.zeros((num_realizations, len(train_subgraph_size), num_models))
-    kernel_results          = np.zeros((num_realizations, len(train_subgraph_size), num_models))
-    kernel_transf_results   = np.zeros((num_realizations, len(train_subgraph_size), num_models))
+    # Initialize result storage
+    results = {
+        'gnn': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
+        'gnn_transfer': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
+        'gntk': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
+        'gntk_transfer': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures)))
+    }
     
     for rlz in range(num_realizations):
+        print(f"\nRealization {rlz+1}/{num_realizations}")
         
-        for sample_ind, sample_size in enumerate(train_subgraph_size):
+        for size_idx, sample_size in enumerate(train_subgraph_sizes):
+            print(f"\nSample size: {sample_size}")
             
-            sampled_data = sample_subgraph(all_data, sample_size)
+            assert isinstance(data, Data)
+            # Sample subgraph
+            sub_data = sample_subgraph(data, sample_size)
             
-            num_subgraph_nodes = sampled_data.num_nodes
-            assert isinstance(num_subgraph_nodes, int)
-            print(sample_size, num_subgraph_nodes)
-            assert isinstance(sampled_data.edge_index, torch.Tensor)
-            edge_list = sampled_data.edge_index.clone()
+            # Create subgraph adjacency
+            assert isinstance(sub_data.edge_index, torch.Tensor)
+            assert isinstance(sub_data.num_nodes, int)
+            edge_weights = torch.full((sub_data.edge_index.size(1),), 1.0/sub_data.num_nodes, device=DEVICE)
+            sub_adj = torch.sparse_coo_tensor(
+                sub_data.edge_index, edge_weights,
+                (sub_data.num_nodes, sub_data.num_nodes), device=DEVICE
+            ).to_dense()
             
-            num_edges = edge_list.shape[1]
-            edge_weights = torch.full((num_edges,), 1.0 / num_subgraph_nodes, device=DEVICE)
-            adjoint_matrix = torch.sparse_coo_tensor(edge_list, edge_weights, (num_subgraph_nodes, num_subgraph_nodes)).to_dense()
-            
-            models = [GNN(f"gnn{cnt}", 'GNN', arch, False, device=DEVICE) for cnt, arch in enumerate(GNN_architectures)]
-            
-            loss_fn = torch.nn.CrossEntropyLoss()
-            
-            for model_ind, model in enumerate(models):
-                
-                original_model = copy.deepcopy(model)
-                
-                
-                val_losses, losses, best_model, best_loss = train(
-                    sampled_data, sampled_data.train_mask, sampled_data.val_mask, model, loss_fn, train_args, logistic=True
-                )
-                
-                test_loss = test(sampled_data, sampled_data.test_mask, best_model, logistic=True)
-                transf_test_loss = test(all_data, all_data.test_mask, best_model, logistic=True)
-
-                gnn_results[rlz, sample_ind, model_ind] = test_loss
-                gnn_transf_results[rlz, sample_ind, model_ind] = transf_test_loss
-                                
-                feats_train, _                  = get_features(sampled_data, sampled_data.train_mask, original_model, best_model)
-                feats_test, test_preds          = get_features(sampled_data, sampled_data.test_mask, original_model, best_model)
-                feats_all_test, all_test_preds  = get_features(all_data, all_data.test_mask, original_model, best_model)
-                
-                train_adjoint_matrix = adjoint_matrix[sampled_data.train_mask][:, sampled_data.train_mask]
-                    
-                consF = model.feature_list[:-1] + model.mlp_list
-                consK = model.K_list + [1] * model.num_mlp_layers
-                
-                kernel = KernelRegression(
-                    len(consF) - 1, consK, consF, train_adjoint_matrix, logistic=True, device=DEVICE
-                )
-                
-                weight_list = original_model.get_weights()
+            # Train and evaluate each GNN architecture
+            for arch_idx, arch in enumerate(gnn_architectures):
+                print(f"Architecture {arch_idx+1}/{len(gnn_architectures)}")
                 
                 breakpoint()
+                # Initialize GNN
+                gnn = GNN(f"gnn{arch_idx}", 'GNN', arch, False, device=DEVICE)
+                original_gnn = copy.deepcopy(gnn)
                 
-                assert isinstance(sampled_data.y, torch.Tensor)
-                kernel_preds = kernel.predict(
-                    feats_train, weight_list, sampled_data.y[sampled_data.train_mask], feats_test
+                # Train GNN
+                _, _, best_gnn, _ = train(
+                    sub_data, sub_data.train_mask, sub_data.val_mask,
+                    gnn, torch.nn.CrossEntropyLoss(), train_args, logistic=True
                 )
                 
-                eig_val = kernel.get_eigenvalues() / num_subgraph_nodes
+                # Evaluate GNN
+                gnn_test_acc = test(sub_data, sub_data.test_mask, best_gnn, logistic=True)
+                gnn_transfer_acc = test(data, data.test_mask, best_gnn, logistic=True)
                 
-                # assert isinstance(test_data.y, torch.Tensor)
-                test_loss = torch.nn.functional.cross_entropy(kernel_preds[0], sampled_data.y[sampled_data.test_mask][:, 0])
+                results['gnn'][rlz, size_idx, arch_idx] = gnn_test_acc
+                results['gnn_transfer'][rlz, size_idx, arch_idx] = gnn_transfer_acc
                 
-                kernel_transf_preds = kernel.predict(
-                    feats_train, weight_list, sampled_data.y[sampled_data.train_mask], feats_all_test, all_adjoint_matrix
+                # Prepare GNTK
+                num_layers = len(arch) - 1  # Number of GNN layers
+                num_mlp_layers = 1  # Assuming 1 MLP per GNN layer
+                
+                # Get features for kernel
+                train_feats, train_y = get_features(sub_data, sub_data.train_mask, original_gnn)
+                test_feats, test_y = get_features(sub_data, sub_data.test_mask, original_gnn)
+                full_feats, full_y = get_features(data, data.test_mask, original_gnn)
+                
+                breakpoint()
+                # Initialize GNTK
+                gntk = GNTKernelRegression(
+                    num_layers=num_layers,
+                    num_mlp_layers=num_mlp_layers,
+                    jk=args.jk,
+                    scale=args.scale,
+                    logistic=True,
+                    device=DEVICE
                 )
                 
-                assert isinstance(all_data.y, torch.Tensor)
-                all_test_loss = torch.nn.functional.cross_entropy(kernel_transf_preds[0], all_data.y[:, 0])
+                # Fit GNTK
+                gntk.fit(
+                    train_features=[f[0] for f in train_feats],  # Remove batch dim
+                    train_adjs=[sub_adj],
+                    y_train=train_y
+                )
                 
-                kernel_results[rlz, sample_ind, model_ind] = test_loss
-                kernel_transf_results[rlz, sample_ind, model_ind] = all_test_loss
+                # Evaluate GNTK
+                test_preds = gntk.predict(
+                    train_features=[f[0] for f in train_feats],
+                    train_adjs=[sub_adj],
+                    y_train=train_y,
+                    test_features=[f[0] for f in test_feats],
+                    test_adjs=[sub_adj]
+                )
+                
+                transfer_preds = gntk.predict(
+                    train_features=[f[0] for f in train_feats],
+                    train_adjs=[sub_adj],
+                    y_train=train_y,
+                    test_features=[f[0] for f in full_feats],
+                    test_adjs=[full_adj]
+                )
+                
+                # Calculate accuracies
+                gntk_test_acc = (test_preds.argmax(1) == test_y).float().mean().item()
+                gntk_transfer_acc = (transfer_preds.argmax(1) == full_y).float().mean().item()
+                
+                results['gntk'][rlz, size_idx, arch_idx] = gntk_test_acc
+                results['gntk_transfer'][rlz, size_idx, arch_idx] = gntk_transfer_acc
+    
+    # Save results
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_file = f"results_{args.dataset}_{timestamp}.pkl"
+    with open(results_file, 'wb') as f:
+        pkl.dump(results, f)
+    
+    print("\nFinal Results:")
+    for key in results:
+        print(f"{key}: {np.mean(results[key], axis=0)}")  # Average over realizations
 
-    print('GNN results:', gnn_results)
-    print('GNN transf results:', gnn_transf_results)
-    print('Kernel results:', kernel_results)
-    print('Kernel transf results:', kernel_transf_results)
-                
 if __name__ == '__main__':
     main()
