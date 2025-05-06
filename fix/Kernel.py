@@ -16,7 +16,6 @@ class GNTKernelRegression:
                  num_layers: int, 
                  num_mlp_layers: int,
                  jk: bool = False,
-                 scale: str = 'degree',
                  logistic: bool = False, 
                  device: str = 'cpu'):
         """
@@ -24,23 +23,18 @@ class GNTKernelRegression:
             num_layers: Number of GNN layers
             num_mlp_layers: Number of MLP layers per GNN layer
             jk: Whether to use jumping knowledge (sum over all layers)
-            scale: Scaling method for adjacency ('uniform' or 'degree')
             logistic: Whether to use logistic regression
             device: Computation device
         """
         self.num_layers = num_layers
         self.num_mlp_layers = num_mlp_layers
         self.jk = jk
-        self.scale = scale
         self.logistic = logistic
         self.device = device
         self.kernel = None
         self.reg = None
         
-        assert scale in ['uniform', 'degree'], "Scale must be 'uniform' or 'degree'"
-        
     def _next_diag(self, S: torch.Tensor) -> tuple:
-        """Process diagonal elements through a normal layer"""
         diag = torch.sqrt(torch.diag(S))
         S = S / (EPS + diag[:, None]) / (EPS + diag[None, :])
         S = torch.clamp(S, -1, 1)
@@ -50,85 +44,47 @@ class GNTKernelRegression:
         S = (S * (torch.pi - torch.arccos(S)) + torch.sqrt(1 - S**2)) / torch.pi
         S = S * diag[:, None] * diag[None, :]
         return S, DS, diag
-    
-    def _adj_diag(self, S: torch.Tensor, adj_block: torch.Tensor, N: int, scale_mat: torch.Tensor) -> torch.Tensor:
-        """Sparse version of adjacency propagation for diagonal elements"""
-        # Ensure S is 2D
-        if S.dim() == 1:
-            S = S.unsqueeze(1)
-        
-        # Convert to sparse if needed
-        if adj_block.layout == torch.strided:
-            adj_block = adj_block.to_sparse()
-        
-        # Flatten S properly
-        S_flat = S.reshape(-1, 1)
-        
-        # Check dimensions
-        if adj_block.shape[1] != S_flat.shape[0]:
-            raise ValueError(f"Dimension mismatch: adj_block {adj_block.shape} vs S_flat {S_flat.shape}")
-        
-        # Perform sparse-dense matmul
-        result = torch.sparse.mm(adj_block, S_flat)
-        
-        # Apply scaling if needed
-        if isinstance(scale_mat, torch.Tensor):
-            result = result * scale_mat.reshape(-1, 1)
-        
-        return result.reshape(N, N)
 
-    def _adj(self, S: torch.Tensor, adj_block: torch.Tensor, N1: int, N2: int, scale_mat: torch.Tensor) -> torch.Tensor:
-        """Sparse version of adjacency propagation for all elements"""
-        # Convert to sparse if needed
+    def _adj(self, S: torch.Tensor, adj_block: torch.Tensor, N1: int, N2: int | None = None) -> torch.Tensor:
+        
+        if N2 is None: N2 = N1
+        
+        # Convert to sparse
         if adj_block.layout == torch.strided:
             adj_block = adj_block.to_sparse()
         
-        # Reshape and perform sparse multiplication
         S_flat = S.reshape(-1, 1)
         result = torch.sparse.mm(adj_block, S_flat)
-        
-        # Apply scaling if needed
-        if isinstance(scale_mat, torch.Tensor):
-            result = result * scale_mat.reshape(-1, 1)
         
         return result.reshape(N1, N2)
 
     def _sparse_kron(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-        """Fixed sparse Kronecker product with dimension checks"""
-        # Ensure sparse format
+        
         if A.layout == torch.strided:
             A = A.to_sparse()
         if B.layout == torch.strided:
             B = B.to_sparse()
         
-        # Get sparse components
         idxA = A.indices()
         valA = A.values()
         idxB = B.indices()
         valB = B.values()
         
-        # Compute output dimensions
         n, m = A.shape[0], B.shape[0]
-        out_size = n * m
-        
-        # Compute Kronecker indices
         rows = (idxA[0] * m).view(-1, 1) + idxB[0].view(1, -1)
         cols = (idxA[1] * m).view(-1, 1) + idxB[1].view(1, -1)
         
-        # Flatten and stack indices
         indices = torch.stack([
             rows.reshape(-1),
             cols.reshape(-1)
         ])
         
-        # Compute Kronecker values
         values = (valA.view(-1, 1) * valB.view(1, -1)).reshape(-1)
         
-        # Create sparse tensor
         return torch.sparse_coo_tensor(
             indices,
             values,
-            (out_size, out_size),
+            (n*m, n*m),
             device=self.device
         ).coalesce()
 
@@ -139,35 +95,11 @@ class GNTKernelRegression:
         if adj.layout == torch.strided:
             adj = adj.to_sparse()
         
-        # Compute scaling matrix
-        scale_mat = torch.tensor(1.0, device=self.device)
-        try:
-            adj_block = self._sparse_kron(adj, adj)
-        except Exception as e:
-            print(f"Error in sparse_kron: {e}")
-            print(f"Adj shape: {adj.shape}")
-            raise
-        
-        # Initialize covariance
+        adj_block = self._sparse_kron(adj, adj)
         sigma = torch.matmul(features, features.T)
         
-        # Verify dimensions before propagation
-        if sigma.numel() != N * N:
-            raise ValueError(f"Sigma size {sigma.shape} doesn't match expected {N}x{N}")
+        sigma = self._adj(sigma, adj_block, N)
         
-        if adj_block.shape[1] != N * N:
-            raise ValueError(f"adj_block cols {adj_block.shape[1]} != N² {N*N}")
-        
-        # First propagation
-        try:
-            sigma = self._adj_diag(sigma, adj_block, N, scale_mat)
-        except Exception as e:
-            print(f"Error in first _adj_diag: {e}")
-            print(f"sigma shape: {sigma.shape}")
-            print(f"adj_block shape: {adj_block.shape}")
-            raise
-        
-        # Rest of the computation...
         ntk = sigma.clone()
         diag_list = []
         
@@ -178,13 +110,13 @@ class GNTKernelRegression:
                 ntk = ntk * dot_sigma + sigma
             
             if layer != self.num_layers - 1:
-                sigma = self._adj_diag(sigma, adj_block, N, scale_mat)
-                ntk = self._adj_diag(ntk, adj_block, N, scale_mat)
+                sigma = self._adj(sigma, adj_block, N)
+                ntk = self._adj(ntk, adj_block, N)
         
         return diag_list
 
     def _next(self, S: torch.Tensor, diag1: torch.Tensor, diag2: torch.Tensor) -> tuple:
-        """Process all elements through a normal layer"""
+        
         S = S / (EPS + diag1[:, None]) / (EPS + diag2[None, :])
         S = torch.clamp(S, -1, 1)
         DS = (torch.pi - torch.arccos(S)) / torch.pi
@@ -210,13 +142,12 @@ class GNTKernelRegression:
         """
         n1, n2 = adj1.shape[0], adj2.shape[0]
         
-        scale_mat = torch.tensor(1.0, device=self.device)        
         adj_block = self._sparse_kron(adj1, adj2)
         
         jump_ntk = 0
         sigma = features1 @ features2.T
         jump_ntk += sigma
-        sigma = self._adj(sigma, adj_block, n1, n2, scale_mat)
+        sigma = self._adj(sigma, adj_block, n1, n2)
         ntk = sigma.clone()
         
         for layer in range(1, self.num_layers):
@@ -229,8 +160,8 @@ class GNTKernelRegression:
                 ntk = ntk * dot_sigma + sigma
             jump_ntk += ntk
             if layer != self.num_layers - 1:
-                sigma = self._adj(sigma, adj_block, n1, n2, scale_mat)
-                ntk = self._adj(ntk, adj_block, n1, n2, scale_mat)
+                sigma = self._adj(sigma, adj_block, n1, n2)
+                ntk = self._adj(ntk, adj_block, n1, n2)
         
         if self.jk:
             return jump_ntk

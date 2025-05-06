@@ -26,32 +26,10 @@ with open(constants_file, 'r') as file:
     CONSTANTS = yaml.safe_load(file)
 
 def set_seed(seed: int) -> None:
-    """Set random seed for reproducibility"""
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-def create_balanced_masks(y: torch.Tensor, num_classes: int, sample_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Create balanced train/val/test masks"""
-    train_mask = torch.zeros_like(y, dtype=torch.bool)
-    val_mask = torch.zeros_like(y, dtype=torch.bool)
-    test_mask = torch.zeros_like(y, dtype=torch.bool)
-    
-    for cls in range(num_classes):
-        cls_indices = (y == cls).nonzero(as_tuple=True)[0]
-        num_cls = cls_indices.numel()
-        
-        num_train = num_cls // 2
-        num_val = num_cls // 4
-        num_test = num_cls - num_train - num_val
-        
-        selected_indices = cls_indices[torch.randperm(num_cls)]
-        train_mask[selected_indices[:num_train]] = True
-        val_mask[selected_indices[num_train:num_train + num_val]] = True
-        test_mask[selected_indices[num_train + num_val:num_train + num_val + num_test]] = True
-    
-    return train_mask, val_mask, test_mask
 
 def sample_subgraph(data: Data, sample_size: int) -> Data:
     
@@ -59,10 +37,6 @@ def sample_subgraph(data: Data, sample_size: int) -> Data:
     assert isinstance(data.y, torch.Tensor)
     assert isinstance(data.edge_index, torch.Tensor)
     assert isinstance(data.num_nodes, int)
-    
-    # num_classes = data.y.max().item() + 1
-    
-    # assert isinstance(num_classes, int)
     
     ratio = sample_size / data.num_nodes
     
@@ -100,14 +74,94 @@ def sample_subgraph(data: Data, sample_size: int) -> Data:
         val_mask=val_mask[train_mask | val_mask | test_mask],
         test_mask=test_mask[train_mask | val_mask | test_mask],
     )
-    
+
+def plot_accuracies(save_dir: str, train_subgraph_sizes: List[int], 
+                    gnn_architectures: List[List[int]], results: Dict[str, np.ndarray]):
+    """Generate and save accuracy plots."""
+    # Compute mean and std of accuracies over realizations
+    gnn_acc_mean = np.mean(results['gnn_acc'], axis=0)
+    gnn_acc_std = np.std(results['gnn_acc'], axis=0)
+    gnn_transf_acc_mean = np.mean(results['gnn_transfer_acc'], axis=0)
+    gnn_transf_acc_std = np.std(results['gnn_transfer_acc'], axis=0)
+    gntk_acc_mean = np.mean(results['gntk_acc'], axis=0)
+    gntk_acc_std = np.std(results['gntk_acc'], axis=0)
+    gntk_transf_acc_mean = np.mean(results['gntk_transfer_acc'], axis=0)
+    gntk_transf_acc_std = np.std(results['gntk_transfer_acc'], axis=0)
+
+    for arch_idx, arch in enumerate(gnn_architectures):
+        # GNN Accuracy Plot
+        fig = plt.figure(figsize=(8, 6))
+        plt.errorbar(train_subgraph_sizes, gnn_acc_mean[:, arch_idx], 
+                     yerr=gnn_acc_std[:, arch_idx], label='GNN Test Accuracy', 
+                     fmt='-o', capsize=5)
+        plt.errorbar(train_subgraph_sizes, gnn_transf_acc_mean[:, arch_idx], 
+                     yerr=gnn_transf_acc_std[:, arch_idx], 
+                     label='GNN Transfer Accuracy', fmt='-o', capsize=5)
+        plt.xlabel('Training Graph Size')
+        plt.ylabel('Accuracy')
+        plt.title(f'GNN Accuracy vs Sample Size, Arch: {arch}')
+        plt.legend()
+        plt.grid(True)
+        fig.savefig(os.path.join(save_dir, f'gnn_accuracy_arch_{arch_idx}.png'), 
+                    bbox_inches='tight')
+        plt.close(fig)
+
+        # GNTK Accuracy Plot
+        fig = plt.figure(figsize=(8, 6))
+        plt.errorbar(train_subgraph_sizes, gntk_acc_mean[:, arch_idx], 
+                     yerr=gntk_acc_std[:, arch_idx], label='GNTK Test Accuracy', 
+                     fmt='-o', capsize=5)
+        plt.errorbar(train_subgraph_sizes, gntk_transf_acc_mean[:, arch_idx], 
+                     yerr=gntk_transf_acc_std[:, arch_idx], 
+                     label='GNTK Transfer Accuracy', fmt='-o', capsize=5)
+        plt.xlabel('Training Graph Size')
+        plt.ylabel('Accuracy')
+        plt.title(f'GNTK Accuracy vs Sample Size, Arch: {arch}')
+        plt.legend()
+        plt.grid(True)
+        fig.savefig(os.path.join(save_dir, f'gntk_accuracy_arch_{arch_idx}.png'), 
+                    bbox_inches='tight')
+        plt.close(fig)
+
+        # Combined Accuracy Plot (GNN vs GNTK)
+        fig = plt.figure(figsize=(8, 6))
+        plt.errorbar(train_subgraph_sizes, gnn_acc_mean[:, arch_idx], 
+                     yerr=gnn_acc_std[:, arch_idx], label='GNN Test Accuracy', 
+                     fmt='-o', capsize=5)
+        plt.errorbar(train_subgraph_sizes, gntk_acc_mean[:, arch_idx], 
+                     yerr=gntk_acc_std[:, arch_idx], label='GNTK Test Accuracy', 
+                     fmt='-s', capsize=5)
+        plt.xlabel('Training Graph Size')
+        plt.ylabel('Accuracy')
+        plt.title(f'GNN vs GNTK Test Accuracy, Arch: {arch}')
+        plt.legend()
+        plt.grid(True)
+        fig.savefig(os.path.join(save_dir, f'gnn_vs_gntk_accuracy_arch_{arch_idx}.png'), 
+                    bbox_inches='tight')
+        plt.close(fig)
+
+        # Combined Transfer Accuracy Plot (GNN vs GNTK)
+        fig = plt.figure(figsize=(8, 6))
+        plt.errorbar(train_subgraph_sizes, gnn_transf_acc_mean[:, arch_idx], 
+                     yerr=gnn_transf_acc_std[:, arch_idx], 
+                     label='GNN Transfer Accuracy', fmt='-o', capsize=5)
+        plt.errorbar(train_subgraph_sizes, gntk_transf_acc_mean[:, arch_idx], 
+                     yerr=gntk_transf_acc_std[:, arch_idx], 
+                     label='GNTK Transfer Accuracy', fmt='-s', capsize=5)
+        plt.xlabel('Training Graph Size')
+        plt.ylabel('Accuracy')
+        plt.title(f'GNN vs GNTK Transfer Accuracy, Arch: {arch}')
+        plt.legend()
+        plt.grid(True)
+        fig.savefig(os.path.join(save_dir, f'gnn_vs_gntk_transfer_accuracy_arch_{arch_idx}.png'), 
+                    bbox_inches='tight')
+        plt.close(fig) 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='Citeseer', choices=['Cora', 'Citeseer', 'PubMed'])
     parser.add_argument('--seed', type=int, default=786)
     parser.add_argument('--jk', action='store_true', help='Use jumping knowledge in GNTK')
-    parser.add_argument('--scale', type=str, default='degree', choices=['uniform', 'degree'])
     parser.add_argument('--save_dir', type=str, default='experiments', help='Directory to save results')
     args = parser.parse_args()
     
@@ -159,10 +213,14 @@ def main():
     
     # Initialize result storage
     results = {
-        'gnn': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
-        'gnn_transfer': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
-        'gntk': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
-        'gntk_transfer': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures)))
+        'gnn_acc': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
+        'gnn_transfer_acc': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
+        'gntk_acc': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
+        'gntk_transfer_acc': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
+        'gnn_loss': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
+        'gnn_transfer_loss': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
+        'gntk_loss': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures))),
+        'gntk_transfer_loss': np.zeros((num_realizations, len(train_subgraph_sizes), len(gnn_architectures)))
     }
     
     for rlz in range(num_realizations):
@@ -219,8 +277,10 @@ def main():
                 print(f"Test Loss: {gnn_test_loss:.4f}, Transfer Loss: {gnn_transf_loss:.4f}")
                 print(f"Test Accuracy: {gnn_test_acc:.4f}, Transfer Accuracy: {gnn_transf_acc:.4f}")
                 
-                results['gnn'][rlz, size_idx, arch_idx] = gnn_test_loss
-                results['gnn_transfer'][rlz, size_idx, arch_idx] = gnn_transf_loss
+                results['gnn_loss'][rlz, size_idx, arch_idx] = gnn_test_loss
+                results['gnn_transfer_loss'][rlz, size_idx, arch_idx] = gnn_transf_loss
+                results['gnn_acc'][rlz, size_idx, arch_idx] = gnn_test_acc
+                results['gnn_transfer_acc'][rlz, size_idx, arch_idx] = gnn_transf_acc
                 
                 # Get features for kernel
                 assert isinstance(sub_data.x, torch.Tensor)
@@ -233,7 +293,6 @@ def main():
                     num_layers=num_layers,
                     num_mlp_layers=num_mlp_layers,
                     jk=args.jk,
-                    scale=args.scale,
                     logistic=True,
                     device=DEVICE
                 )
@@ -271,18 +330,22 @@ def main():
                 print(f"GNTK Test Loss: {gntk_test_loss:.4f}, GNTK Transfer Loss: {gntk_transfer_loss:.4f}")
                 print(f"GNTK Test Accuracy: {gntk_test_acc:.4f}, GNTK Transfer Accuracy: {gntk_transfer_acc:.4f}")
                 
-                results['gntk'][rlz, size_idx, arch_idx] = gntk_test_loss
-                results['gntk_transfer'][rlz, size_idx, arch_idx] = gntk_transfer_loss
+                results['gntk_loss'][rlz, size_idx, arch_idx] = gntk_test_loss
+                results['gntk_transfer_loss'][rlz, size_idx, arch_idx] = gntk_transfer_loss
+                results['gntk_acc'][rlz, size_idx, arch_idx] = gntk_test_acc
+                results['gntk_transfer_acc'][rlz, size_idx, arch_idx] = gntk_transfer_acc
     
     results_file = os.path.join(save_dir, f"results_{timestamp}.pkl")
     with open(results_file, 'wb') as f:
         pkl.dump(results, f)
+        
+    plot_accuracies(save_dir, train_subgraph_sizes, gnn_architectures, results)
     
     print("\nFinal Results:")
     for key in results:
         print(f"{key}: {np.mean(results[key], axis=0)}")  # Average over realizations
 
-    kernel_transf = np.abs((results['gntk'] - results['gntk_transfer']) / results['gntk_transfer'])
+    kernel_transf = np.abs((results['gntk_loss'] - results['gntk_transfer_loss']) / results['gntk_transfer_loss'])
     kernel_transf_avg = np.mean(kernel_transf, axis=0)
     kernel_transf_std = np.std(kernel_transf, axis=0)
     
@@ -297,7 +360,7 @@ def main():
 
     # GNN and kernel transferability plot
 
-    gnn_transf = np.abs((results['gnn'] - results['gnn_transfer']) / results['gnn_transfer'])
+    gnn_transf = np.abs((results['gnn_loss'] - results['gnn_transfer_loss']) / results['gnn_transfer_loss'])
     gnn_transf_avg = np.mean(gnn_transf,axis=0)
     gnn_transf_std = np.std(gnn_transf,axis=0)
 
