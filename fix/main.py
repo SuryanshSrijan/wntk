@@ -77,7 +77,6 @@ def sample_subgraph(data: Data, sample_size: int) -> Data:
 
 def plot_accuracies(save_dir: str, train_subgraph_sizes: List[int], 
                     gnn_architectures: List[List[int]], results: Dict[str, np.ndarray]):
-    """Generate and save accuracy plots."""
     # Compute mean and std of accuracies over realizations
     gnn_acc_mean = np.mean(results['gnn_acc'], axis=0)
     gnn_acc_std = np.std(results['gnn_acc'], axis=0)
@@ -89,7 +88,6 @@ def plot_accuracies(save_dir: str, train_subgraph_sizes: List[int],
     gntk_transf_acc_std = np.std(results['gntk_transfer_acc'], axis=0)
 
     for arch_idx, arch in enumerate(gnn_architectures):
-        # GNN Accuracy Plot
         fig = plt.figure(figsize=(8, 6))
         plt.errorbar(train_subgraph_sizes, gnn_acc_mean[:, arch_idx], 
                      yerr=gnn_acc_std[:, arch_idx], label='GNN Test Accuracy', 
